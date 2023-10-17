@@ -60,9 +60,10 @@ TARGET=${2?}
 # Create a temporary directory
 if [[ ! $WORKINGDIR ]]; then
   if [[ ! $TMPDIR ]]; then
-    TMPDIR=$(mktemp -d trim_neck.XXXXXX.tmpdir)
+    WORKINGDIR=$(mktemp -p /tmp -d trim_neck.XXXXXX.tmpdir)
+  else
+    WORKINGDIR=$(mktemp -p $TMPDIR -d trim_neck.XXXXXX.tmpdir)
   fi
-  WORKINGDIR=$(mktemp -d -p $TMPDIR trim_neck.XXXXXX.tmpdir)
 else
   mkdir -p $WORKINGDIR
 fi
