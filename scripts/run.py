@@ -174,7 +174,7 @@ for participant in participants:
             shutil.copyfile(tmp_mask_trim, output_mask_full_path)
 
             output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
-            output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
+            output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
             with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
                 json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
 
