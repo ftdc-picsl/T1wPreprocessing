@@ -50,8 +50,8 @@ if (args.device == 'cpu'):
     hdbet_device_settings = ['-device', args.device, '-mode', 'fast', '-tta', '0']
 
 # Make this under system TMPDIR, cleaned up automatically
-working_dir_tmpdir = tempfile.TemporaryDirectory(suffix=f".t1wpreproc.tmpdir")
-working_dir = working_dir_tmpdir.name
+base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='.t1wpreproc.tmpdir')
+base_working_dir = base_working_dir_tmpdir.name
 
 input_dataset_dir = args.input_dataset
 output_dataset_dir = args.output_dataset
@@ -94,6 +94,10 @@ if not os.path.isdir(output_dataset_dir):
 for participant in participants:
 
     print(f"Processing participant {participant}")
+
+    # Make a participant-specific working dir
+    working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"{participant}.t1wpreproc.tmpdir")
+    working_dir = working_dir_tmpdir.name
 
     sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}")) if f.is_dir()
                 and f.name.startswith('ses-')]
@@ -161,7 +165,7 @@ for participant in participants:
             tmp_t1w_trim = os.path.join(working_dir, 'T1wNeckTrim.nii.gz')
             tmp_mask_trim = os.path.join(working_dir, 'T1wNeckTrim_mask.nii.gz')
 
-            subprocess.run(['trim_neck.sh', '-d', '-c', '10', tmp_t1w, tmp_t1w_trim], check = True)
+            subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, tmp_t1w, tmp_t1w_trim], check = True)
 
             # Pad image with c3d and reslice mask to same space
             pad_mm = 10
