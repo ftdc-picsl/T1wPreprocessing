@@ -52,7 +52,7 @@ Required arguments:
                         Input BIDS dataset dir, containing the source images
   --output-dataset OUTPUT_DATASET
                         Output BIDS dataset dir
-  --participant PARTICIPANT
+  --participant PARTICIPANT, --participant-list PARTICIPANT
                         Participant to process, or a text file containing a list of participants
 
 Optional arguments:

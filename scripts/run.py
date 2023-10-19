@@ -25,19 +25,21 @@ If the output dataset does not exist, it will be created.
 required = parser.add_argument_group('Required arguments')
 required.add_argument("--input-dataset", help="Input BIDS dataset dir, containing the source images", type=str, required=True)
 required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
-required.add_argument("--participant", help="Participant to process, or a text file containing a list of participants",
-                      type=str, required=True)
+required.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a list of "
+                      "participants", type=str, required=True)
 optional = parser.add_argument_group('Optional arguments')
 optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
-optional.add_argument("--device", help="GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower", type=str, default='0')
+optional.add_argument("--device", help="GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower", type=str,
+                      default='0')
 args = parser.parse_args()
 
 # Check for the existence of the nvidia controller
 if (args.device != 'cpu'):
     try:
         nvidia_status = subprocess.check_output(['nvidia-smi', '-i', args.device])
+        print("Using GPU device " + args.device + ". Device status:")
         print(nvidia_status.decode('utf-8'))
-    except Exception: # this command not being found can raise quite a few different errors depending on the configuration
+    except Exception:
         print('Cannot get status of GPU device ' + args.device + ' using nvidia-smi.'
               'Please check that the device is available and that nvidia-smi is installed.')
         sys.exit(1)
@@ -50,7 +52,7 @@ if (args.device == 'cpu'):
     hdbet_device_settings = ['-device', args.device, '-mode', 'fast', '-tta', '0']
 
 # Make this under system TMPDIR, cleaned up automatically
-base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='.t1wpreproc.tmpdir')
+base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='t1wpreproc.tmpdir')
 base_working_dir = base_working_dir_tmpdir.name
 
 input_dataset_dir = args.input_dataset
@@ -77,9 +79,9 @@ if not os.path.isdir(output_dataset_dir):
     # Write dataset_description.json
     # Can't get too descriptive on the pipeline description as we can't be sure what version of this
     # pipeline will be used in some later run. But can at least say what it is
-    output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0', 'DatasetType': 'derivative',
-                            'PipelineDescription': {'Name': 'T1wPreprocessing',
-                                                    'CodeURL': 'https://github.com/ftdc-picsl/T1wPreprocessing'}}
+    output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0',
+                             'DatasetType': 'derivative', 'PipelineDescription': {'Name': 'T1wPreprocessing',
+                             'CodeURL': 'https://github.com/ftdc-picsl/T1wPreprocessing'}}
 
     # Write json to output dataset
     with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
@@ -91,16 +93,19 @@ if not os.path.isdir(output_dataset_dir):
 # _image - image file name
 # _source_entities - BIDS file name entities for source image, create derivatives by appending to this
 
+# List subject,session,image for all errors
+pipeline_error_list = []
+
 for participant in participants:
 
     print(f"Processing participant {participant}")
 
     # Make a participant-specific working dir
-    working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"{participant}.t1wpreproc.tmpdir")
+    working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{participant}.tmpdir")
     working_dir = working_dir_tmpdir.name
 
-    sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}")) if f.is_dir()
-                and f.name.startswith('ses-')]
+    sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
+                if f.is_dir() and f.name.startswith('ses-')]
 
     for sess in sessions:
 
@@ -149,11 +154,16 @@ for participant in participants:
 
             subprocess.run(['c3d', t1w_full_path, '-swapdim', 'LPI', '-o', tmp_t1w])
 
+            pipeline_error = False
+
             # Now call hd-bet
             hd_bet_cmd = ['hd-bet', '-i', tmp_t1w, '-o', tmp_output_t1w, '-b', '0', '-s',
                             '1', '-pp', '1']
             hd_bet_cmd.extend(hdbet_device_settings)
-            subprocess.run(hd_bet_cmd, check = True)
+            result = subprocess.run(hd_bet_cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"Error running hd-bet on {t1w_image}")
+                pipeline_error = True
 
             # For testing - output resliced image and mask without trimming
             # shutil.copyfile(tmp_t1w, os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat',
@@ -165,13 +175,28 @@ for participant in participants:
             tmp_t1w_trim = os.path.join(working_dir, 'T1wNeckTrim.nii.gz')
             tmp_mask_trim = os.path.join(working_dir, 'T1wNeckTrim_mask.nii.gz')
 
-            subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, tmp_t1w, tmp_t1w_trim], check = True)
+            result = subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, tmp_t1w, tmp_t1w_trim], check = False,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"Error trimming neck on {t1w_image}")
+                print(result.stderr)
+                pipeline_error = True
 
             # Pad image with c3d and reslice mask to same space
             pad_mm = 10
-            subprocess.run(['c3d', tmp_t1w_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm", f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o',
-                            tmp_t1w_trim, '-interpolation', 'NearestNeighbor', tmp_mask, '-reslice-identity', '-type', 'uchar',
-                                '-o', tmp_mask_trim], check = True)
+            result = subprocess.run(['c3d', tmp_t1w_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
+                                    f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o', tmp_t1w_trim, '-interpolation',
+                                    'NearestNeighbor', tmp_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
+                                    check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"Error padding image on {t1w_image}")
+                print(result.stderr)
+                pipeline_error = True
+
+            # In case of error, don't write output files
+            if pipeline_error:
+                pipeline_error_list.append(f"sub-{participant}/ses-{sess}/anat/{t1w_image}")
+                continue
 
             # Now copy to output dataset and make sidecars
             shutil.copyfile(tmp_t1w_trim, output_t1w_full_path)
@@ -186,3 +211,16 @@ for participant in participants:
             output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
             with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
                 json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+
+
+print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
+print("Processed participants: " + str(participants) + "\n")
+
+# Print list of errors
+if len(pipeline_error_list) > 0:
+    print("Total errors: " + str(len(pipeline_error_list)))
+    print("Errors occurred on the following images:")
+    for error_img in pipeline_error_list:
+        print(error_img)
+else:
+    print("Total errors: 0")
