@@ -44,4 +44,13 @@ fi
 dockerCommit=$gitTag
 
 # Build the docker image
-docker build -t "cookpa/ftdc-t1w-preproc:$dockerTag" . --build-arg GIT_REMOTE="$gitRemote" --build-arg GIT_COMMIT="$gitTag"
+docker build -t "ftdc-t1w-preproc:$dockerTag" . --build-arg GIT_REMOTE="$gitRemote" --build-arg GIT_COMMIT="$gitTag"
+
+if [[ $? -ne 0 ]] ; then
+    echo "Docker build failed - see output above"
+    exit 1
+else
+    echo
+    echo "Build successful: ftdc-t1w-preproc:$dockerTag"
+    echo
+fi
