@@ -35,7 +35,7 @@ fi
 
 dockerTag=${gitTag:1}
 
-if [[ ! "$dockerTag" == "v{$gitTag}" ]]; then
+if [[ ! "v${dockerTag}" == "${gitTag}" ]]; then
     echo "Tag $dockerTag does not match git tag $gitTag"
     exit 1
 fi
