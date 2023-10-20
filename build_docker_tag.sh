@@ -3,15 +3,13 @@
 # Get git information and build docker image
 
 if [[ $# -gt 0 ]] ; then
-    echo "usage: $0 <tag> [-h]"
-    echo "Builds a docker image with the given tag, and embeds git info. Run from source directory."
+    echo "usage: $0 [-h]"
+    echo "Builds a docker image from tagged source, and embeds git info. Run from source directory."
     echo
-    echo "The tag should be numeric, matching the commit tag in git, eg '0.1.0' for tag 'v0.1.0'"
+    echo "For a tagged commit vX.Y.Z, the docker image will be tagged as X.Y.Z."
     echo
     exit 1
 fi
-
-dockerTag=$1
 
 # Get git information
 status=$( git status -s )
@@ -34,6 +32,8 @@ if [[ -z "$gitTag" ]]; then
     echo "No tag found for commit $hash"
     exit 1
 fi
+
+dockerTag=${gitTag:1}
 
 if [[ ! "$dockerTag" == "v{$gitTag}" ]]; then
     echo "Tag $dockerTag does not match git tag $gitTag"
