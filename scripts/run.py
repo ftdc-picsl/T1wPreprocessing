@@ -189,7 +189,33 @@ for participant in participants:
                                     'NearestNeighbor', tmp_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
                                     check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if result.returncode != 0:
-                print(f"Error padding image on {t1w_image}")
+                print(f"Error padding image {tmp_t1w_trim}")
+                print(result.stderr)
+                pipeline_error = True
+
+            # Set origin to mask centroid - this prevents a shift in single-subject template construction
+            # because the raw origins are not set consistently
+            result = subprocess.run(['c3d', tmp_mask_trim, '-centroid'], check = False, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
+
+            match = re.search(centroid_pattern, result.stdout)
+
+            if match:
+                # Extract the values from the match
+                mask_centroid_vox = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+            else:
+                print("Could not get centroid from mask {tmp_mask_trim}")
+                print(result.stderr)
+                pipeline_error = True
+
+            # Set origin to centroid for both mask and T1w
+            centroid_str = str.join('x',[str(c) for c in mask_centroid_vox]) + "vox"
+            result = subprocess.run(['c3d', tmp_t1w_trim, '-origin-voxel', centroid_str, '-o', tmp_t1w_trim,
+                                     tmp_mask_trim, '-origin-voxel', centroid_str, '-o', tmp_mask_trim],
+                                    check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"Error setting origin image on {tmp_t1w_trim}")
                 print(result.stderr)
                 pipeline_error = True
 
