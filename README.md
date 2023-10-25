@@ -23,6 +23,8 @@ overwritten.
 
 3. Trim the neck with the `trim_neck.sh` script.
 
+4. Set the origin of the trimmed T1w and brain mask to the centroid of the brain mask.
+
 
 ## Output
 
