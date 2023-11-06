@@ -38,10 +38,20 @@ session, with links to the source data in their respective sidecars.
 Output of `docker run --rm -it cookpa/ftdc-t1w-preproc:latest --help`
 
 ```
-usage: HD-BET brain extraction and additional preprocessing --input-dataset INPUT_DATASET --output-dataset OUTPUT_DATASET --participant PARTICIPANT [-h] [--device DEVICE]
+usage: HD-BET brain extraction and additional preprocessing --input-dataset INPUT_DATASET --output-dataset OUTPUT_DATASET [-h] [--device DEVICE] [--participant PARTICIPANT] [--session SESSION]
 
 Wrapper for brain extraction using using HD-BET followed by neck trimming with c3d. Images will be
 reoriented to LPI orientation before processing.
+
+Input can either be by participant or by session. By participant:
+
+   '--participant 01'
+   '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
+
+All available sessions will be processed for each participant. To process selected sessions:
+
+    '--session 01,MR1'
+    '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
 
 Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
     _desc-brain_mask.nii.gz - brain mask
@@ -54,11 +64,14 @@ Required arguments:
                         Input BIDS dataset dir, containing the source images
   --output-dataset OUTPUT_DATASET
                         Output BIDS dataset dir
-  --participant PARTICIPANT, --participant-list PARTICIPANT
-                        Participant to process, or a text file containing a list of participants
 
 Optional arguments:
   -h, --help            show this help message and exit
   --device DEVICE       GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower
+  --participant PARTICIPANT, --participant-list PARTICIPANT
+                        Participant to process, or a text file containing a list of participants
+  --session SESSION, --session-list SESSION
+                        Session to process, in the format 'participant,session' or a text file containing a list of
+                        participants and sessions.
 
 ```
