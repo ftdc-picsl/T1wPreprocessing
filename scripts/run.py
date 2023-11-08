@@ -82,6 +82,9 @@ output_dataset_dir = args.output_dataset
 
 participant_sessions = []
 
+# List maximum possible combination of subject,session,image for all errors
+pipeline_error_list = []
+
 if args.participant is not None:
     if os.path.isfile(args.participant):
         with open(args.participant, 'r') as file_in:
@@ -91,9 +94,16 @@ if args.participant is not None:
 
     for participant in participants:
         # Get list of sessions for this participant
-        sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
+        try:
+            sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
                 if f.is_dir() and f.name.startswith('ses-')]
-        participant_sessions.extend([participant, session] for session in sessions)
+            if len(sessions) == 0:
+                print(f"No sessions found for participant {participant}")
+                pipeline_error_list.append(f"sub-{participant}")
+                continue
+            participant_sessions.extend([participant, session] for session in sessions)
+        except FileNotFoundError:
+            print(f"Participant {participant} not found in input dataset {input_dataset_dir}")
 else:
     if os.path.isfile(args.session):
         with open(args.session, 'r') as file_in:
@@ -132,9 +142,6 @@ if not os.path.isdir(output_dataset_dir):
 # _image - image file name
 # _source_entities - BIDS file name entities for source image, create derivatives by appending to this
 
-# List subject,session,image for all errors
-pipeline_error_list = []
-
 for participant,sess in participant_sessions:
 
     print(f"Processing participant {participant}, session {sess}")
@@ -144,8 +151,18 @@ for participant,sess in participant_sessions:
 
     session_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}")
 
-    t1w_images = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
+    try:
+        t1w_images = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
                 if f.is_file() and f.name.endswith('_T1w.nii.gz')]
+    except FileNotFoundError:
+        print(f"Participant {participant} Session {sess} not found in input dataset {input_dataset_dir}")
+        pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
+        continue
+
+    if len(t1w_images) == 0:
+        print(f"No T1w images found for participant {participant} session {sess}")
+        pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
+        continue
 
     for t1w_image in t1w_images:
 
@@ -273,12 +290,11 @@ for participant,sess in participant_sessions:
     working_dir_tmpdir.cleanup()
 
 print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
-print("Processed participants: " + str(participants) + "\n")
 
 # Print list of errors
 if len(pipeline_error_list) > 0:
     print("Total errors: " + str(len(pipeline_error_list)))
-    print("Errors occurred on the following images:")
+    print("Errors occurred on the following subjects / sessions / images:")
     for error_img in pipeline_error_list:
         print(error_img)
 else:
