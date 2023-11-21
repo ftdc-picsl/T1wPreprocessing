@@ -9,293 +9,601 @@ import subprocess
 import sys
 import tempfile
 
+# WIP: refactor subprocess calls to support optional verbose output
+__verbose__ = False
 
-parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-                                 prog="HD-BET brain extraction and additional preprocessing", add_help = False, description='''
-Wrapper for brain extraction using using HD-BET followed by neck trimming with c3d. Images will be
-reoriented to LPI orientation before processing.
+# Uses subprocess.run to run a command, and prints the command and output if verbose is set
+# returns a boolean indicating whether the command succeeded
+# Example:
+#   pipeline_error = run_command(['c3d', my_image, '-swapdim', output_orientation, '-o', reoriented_image])
+#
+def run_command(cmd):
+    result = subprocess.run(cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-Input can either be by participant or by session. By participant:
+    if (__verbose__):
+        print("--- command ---")
+        print(" ".join(cmd))
+        print("--- end command ---")
+        print("--- command output ---")
+        print(result.stdout)
+        print("--- end command output ---")
 
-   '--participant 01'
-   '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
+    if result.returncode != 0:
+        print(f"Error running command: {' '.join(cmd)}")
+        print(result.stdout)
 
-All available sessions will be processed for each participant. To process selected sessions:
+    return { 'success': result.returncode == 0, 'cmd_str': ' '.join(cmd), 'stdout': result.stdout }
 
-    '--session 01,MR1'
-    '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
+# Reset image and mask origin to mask centroid
+#
+# Returns: dictionary with keys 'output_image', 'output_mask', 'pipeline_error'
+#
+def reset_origin(input_image, input_mask, working_dir):
 
-Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
-    _desc-brain_mask.nii.gz - brain mask
-    _desc-preproc_T1w.nii.gz - preprocessed T1w image
+    output_image = os.path.join(working_dir, 'inputOriginReset.nii.gz')
+    output_mask = os.path.join(working_dir, 'inputOriginReset_mask.nii.gz')
 
-If the output dataset does not exist, it will be created.
+    # Set origin to mask centroid - this prevents a shift in single-subject template construction
+    # because the raw origins are not set consistently across sessions or protocols
+    result = subprocess.run(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
+
+    match = re.search(centroid_pattern, result.stdout)
+
+    if match:
+    # Extract the values from the match
+        mask_centroid_vox = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+    else:
+        print("Could not get centroid from mask {input_mask}")
+        print(result.stderr)
+        pipeline_error = True
+
+    # Set origin to centroid for both mask and T1w
+    centroid_str = str.join('x',[str(c) for c in mask_centroid_vox]) + "vox"
+    result = subprocess.run(['c3d', input_image, '-origin-voxel', centroid_str, '-o', output_image,
+                                input_mask, '-origin-voxel', centroid_str, '-type', 'uchar', '-o', output_mask],
+                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Error setting origin image on {tmp_t1w_trim}")
+        print(result.stderr)
+        pipeline_error = True
+
+    return { 'output_image': output_image, 'output_mask': output_mask, 'pipeline_error': pipeline_error }
+
+# Helper function for QC images
+def tile_images(image_files, output_path):
+
+    from PIL import Image
+
+    # Load the images from the provided paths
+    images = [Image.open(file) for file in image_files]
+
+    # Get the maximum height among all images
+    max_height = max([img.height for img in images])
+
+    # Zero-fill images to match the maximum height
+    zero_filled_images = []
+    for img in images:
+        width, height = img.size
+        blank = Image.new('RGB', (width, max_height), color='black')
+        blank.paste(img, (0, max_height - height))
+        zero_filled_images.append(blank)
+
+    # Calculate the total width required for the stitched image
+    total_width = sum(img.width for img in zero_filled_images)
+
+    # Create a new blank image to stitch the images together
+    result = Image.new('RGB', (total_width, max_height), color='black')
+
+    # Paste the zero-filled images onto the new image from left to right
+    current_width = 0
+    for img in zero_filled_images:
+        result.paste(img, (current_width, 0))
+        current_width += img.width
+
+    # Save the result
+    result.save(output_path)
+
+# QC using c3d. Inputs in the untrimmed space (we QC both neck trimming and brain masking)
+#
+# If the brain mask is blank or extends outside the trim region, pipeline_error will be set to True
+#
+# Inputs:
+#   full_coverage_t1w - the original T1w image, reoriented to LPI (returned from run_hdbet)
+#   brain_mask - the brain mask from hd-bet, in the untrimmed space
+#   trim_region - a mask in the original space containing 1 for voxels in the trimmed region and 0 for voxels outside
+#   working_dir - the working directory
+#
+# Returns: dictionary with keys 'qc_rgb_png', 'pipeline_error'
+def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
+    pipeline_error = False
+    # Make a combined mask of the brain mask and the trimmed region
+    combined_mask = os.path.join(working_dir, 'combined_mask.nii.gz')
+    # Multiply brain mask by 2 to make it brighter, then add to trimmed region
+    result = subprocess.run(['c3d', brain_mask, '-scale', '2', trim_region_mask, '-add', '-o', combined_mask],
+                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Error combining brain mask and trimmed region")
+        print(result.stderr)
+        pipeline_error = True
+
+    # The result should be a mask with 3 for voxels in the brain, and 1 for voxels in the trimmed region but
+    # outside the brain. Use this to make a plot of the brain mask on the T1w image
+
+    # Volume of mask in mm^3
+    result = subprocess.run(['c3d', combined_mask, '-dup', '-lstat'], check = False, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print(f"Error getting mask stats")
+        print(result.stderr)
+        pipeline_error = True
+
+    # Parse output for labels 2 and 3 - 2 should not exist, if it does, it implies the brain mask is
+    # outside the trimmed region
+    lstats = [line.lstrip() for line in result.stdout.splitlines()]
+    label2_found = False
+    label3_found = False
+    label3_volume = 0
+    for lstat in lstats:
+        if lstat.startswith('2'):
+            label2_found = True
+        if lstat.startswith('3'):
+            label3_found = True
+
+    if label2_found:
+        print(f"Neck trimming error: brain mask extends outside trimmed region")
+        print(result.stderr)
+        pipeline_error = True
+
+    if not label3_found:
+        print(f"Brain masking error: no brain voxels inside trimmed T1w space")
+        print(result.stderr)
+        pipeline_error = True
+
+    # Make an RGB image of the trim and brain mask on the T1w image
+    # Need to rescale T1w to range 0-255, then overlay colors
+    # First define a color LUT
+    color_lut = os.path.join(working_dir, 'color_lut.txt')
+    # LUT columns "label_value red green blue alpha"
+    # Alpha values must be between 0 and 1. Red, green and blue values should be on the same
+    # order as the intensity of the grey image (typically 0-255).
+    with open(color_lut, 'w') as file_out:
+        file_out.write("0 0 0 0 0\n")
+        file_out.write("1 255 0 0 0.3\n")
+        file_out.write("2 128 255 0 0.3\n")
+        file_out.write("3 32 32 255 0.3\n")
+
+    qc_sag_slice = os.path.join(working_dir, 'qc_sag_slice.png')
+    qc_cor_slice = os.path.join(working_dir, 'qc_cor_slice.png')
+
+    qc_rgb_slices = os.path.join(working_dir, 'qc_rgb_slices.png')
+
+    # slice the overlay image for QC - output coronal and sagittal slice
+    result = subprocess.run(['c3d', '-type', 'uchar', full_coverage_t1w, '-stretch', '0', '99%', '0', '250', '-clip', '0', '255',
+                             '-as', 'gray', '-slice', 'x', '50%', '-popas', 'gslice_sag', '-push', 'gray', '-slice', 'y',
+                            '50%', '-popas', 'gslice_cor', combined_mask, '-as', 'mask', '-slice', 'x', '50%', '-popas',
+                            'mslice_sag', '-push', 'mask', '-slice', 'y', '50%', '-popas', 'mslice_cor', '-clear', '-push',
+                            'gslice_cor', '-push', 'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1',
+                            '-clear', '-push', 'gslice_sag', '-push', 'mslice_sag', '-foreach', '-flip', 'xy', '-endfor',
+                            '-oli', color_lut, '1', '-omc', qc_sag_slice, '-clear', '-push', 'gslice_cor', '-push',
+                            'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1', '-omc', qc_cor_slice],
+                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print(f"Error making QC RGB image")
+        print(result.stderr)
+        pipeline_error = True
+
+    # tile the slices left-right into a single image
+    tile_images([qc_sag_slice, qc_cor_slice], qc_rgb_slices)
+
+    return { 'qc_rgb_png': qc_rgb_slices, 'pipeline_error': pipeline_error }
 
 
-''')
-required = parser.add_argument_group('Required arguments')
-required.add_argument("--input-dataset", help="Input BIDS dataset dir, containing the source images", type=str, required=True)
-required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
-optional = parser.add_argument_group('Optional arguments')
-optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
-optional.add_argument("--device", help="GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower", type=str,
-                      default='0')
-optional.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a list of "
-                      "participants", type=str)
-optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a text "
-                      "file containing a list of participants and sessions.", type=str)
-args = parser.parse_args()
+# Runs preprocessing and HD-BET brain extraction
+# The image will be reoriented to LPI orientation before processing - it is a requirement of HD-BET
+# that the image be "in the same orientation as the MNI template". Most structural images from dcm2niix
+# already meet this requirement.
+#
+# FSL's MNI template has a negative determinant for the transformation matrix, which dcm2niix output and
+# templateflow templates do not. But it does not appear to cause problems for HD-BET.
+#
+# Inputs:
+#   input_image - the input T1w image
+#   working_dir - the working directory
+#   hdbet_device_settings - a list of hd-bet settings e.g. ['-device', '0', '-mode', 'fast', '-tta', '0']
+#
+# Returns: dictionary with keys 'reoriented_image', 'mask', 'pipeline_error'
+def run_hdbet(input_image, working_dir, hdbet_device_settings):
 
-# Check for the existence of the nvidia controller
-if (args.device != 'cpu'):
-    try:
-        nvidia_status = subprocess.check_output(['nvidia-smi', '-i', args.device])
-        print("Using GPU device " + args.device + ". Device status:")
-        print(nvidia_status.decode('utf-8'))
-    except Exception:
-        print('Cannot get status of GPU device ' + args.device + ' using nvidia-smi.'
-              'Please check that the device is available and that nvidia-smi is installed.')
+    pipeline_error = False
+
+    output_orientation = 'LPI'
+
+    # Conform input to orientation and write to temp dir
+    reoriented_image = os.path.join(working_dir, f"input_reoriented_{output_orientation}.nii.gz")
+
+    result = subprocess.run(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
+    if result.returncode != 0:
+        print(f"Error reorienting {input_image}")
+        pipeline_error = True
+
+    # This isn't actually written because we use the -b 0 option to hd-bet
+    tmp_output_image = os.path.join(working_dir, 'hdBetOutput.nii.gz')
+
+    # This is determined by hd-bet based on tmp_output_image
+    tmp_mask = os.path.join(working_dir, 'hdBetOutput_mask.nii.gz')
+
+    # Now call hd-bet
+    hd_bet_cmd = ['hd-bet', '-i', reoriented_image, '-o', tmp_output_image, '-b', '0', '-s',
+                    '1', '-pp', '1']
+    hd_bet_cmd.extend(hdbet_device_settings)
+
+    result = subprocess.run(hd_bet_cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Error running hd-bet on {input_image}")
+        pipeline_error = True
+
+    return { 'reoriented_image': reoriented_image, 'mask': tmp_mask, 'pipeline_error': pipeline_error }
+
+
+# Trim the neck from the image, and pad with empty space on all sides.
+# Resample the mask into the trimmed space
+# Return trimmed images plus a mask in the original space containing the trim region
+# and brain mask for QC
+#
+# Inputs:
+#   input_image - the input T1w image to this should be the output from run_hdbet (already reoriented to LPI)
+#   input_mask - the brain mask from hd-bet, in the untrimmed space
+#   working_dir - the working directory
+#   pad_mm - number of mm to pad on each side after trimming
+#
+def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
+    pipeline_error = False
+    # trim neck with c3d, reslice mask into trimmed space
+    tmp_image_trim = os.path.join(working_dir, 'T1wNeckTrim.nii.gz')
+    tmp_mask_trim = os.path.join(working_dir, 'T1wNeckTrim_mask.nii.gz')
+
+    # This is in the original space, and contains 1 for voxels in the trimmed output
+    # and 0 for voxels outside the trimmed region. Used for QC
+    tmp_trim_region_image = os.path.join(working_dir, 'T1wNeckTrim_region.nii.gz')
+
+    result = subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
+                            tmp_image_trim], check = False,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Error trimming neck on {input_image}")
+        print(result.stderr)
+        pipeline_error = True
+
+    # Pad image with c3d and reslice mask to same space
+    result = subprocess.run(['c3d', tmp_image_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
+                            f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o', tmp_image_trim, '-interpolation',
+                            'NearestNeighbor', input_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
+                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Error padding image {tmp_image_trim}")
+        print(result.stderr)
+        pipeline_error = True
+
+    return { 'output_image': tmp_image_trim, 'output_mask': tmp_mask_trim, 'trim_region_input_space': tmp_trim_region_image,
+            'pipeline_error': pipeline_error }
+
+
+#
+# Get the volume of the mask in ml
+# Inputs: mask_image - the mask image, must be binary
+# Returns: float containing the volume in mm^3
+#
+def get_mask_volume(mask_image):
+
+    pipeline_error = False
+
+    result = subprocess.run(['c3d', mask_image, '-voxel-integral'], check = False, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print(f"Error getting mask stats")
+        print(result.stderr)
+        pipeline_error = True
+
+    # Parse output to get volume
+    # Expected output example: Voxel Integral: 1.14778e+07
+    volume = float(result.stdout.splitlines()[0].split()[2])
+
+    # Convert to ml
+    volume_ml = volume / 1000
+
+    return { 'volume_ml': volume_ml, 'pipeline_error': pipeline_error }
+
+
+def main():
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
+                                    prog="HD-BET brain extraction and additional preprocessing", add_help = False,
+                                    description='''Wrapper for brain extraction using using HD-BET followed by neck
+                                    trimming with c3d. Images will be reoriented to LPI orientation before processing.
+
+    Input can either be by participant or by session. By participant:
+
+    '--participant 01'
+    '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
+
+    All available sessions will be processed for each participant. To process selected sessions:
+
+        '--session 01,MR1'
+        '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
+
+    Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
+        _desc-brain_mask.nii.gz - brain mask
+        _desc-preproc_T1w.nii.gz - preprocessed T1w image
+
+    In addition, a QC PNG image is created for each input image, showing the brain mask and the trimmed region.
+
+    If the output dataset does not exist, it will be created.
+
+    ''')
+    required = parser.add_argument_group('Required arguments')
+    required.add_argument("--input-dataset", help="Input BIDS dataset dir, containing the source images", type=str,
+                          required=True)
+    required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
+    optional = parser.add_argument_group('Optional arguments')
+    optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    optional.add_argument("--device", help="GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower",
+                          type=str, default='0')
+    optional.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a "
+                          "list of participants", type=str)
+    optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
+                          "text file containing a list of participants and sessions.", type=str)
+    optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
+    optional.add_argument("--keep-workdir", help="Copy working directory to output, for debugging purposes. Either 'never', "
+                          " 'on_error', or 'always'.", type=str, default='on_error')
+    optional.add_argument("--verbose", help="Verbose output (not yet implemented)", action='store_true')
+    args = parser.parse_args()
+
+    # Check for the existence of the nvidia controller
+    if (args.device != 'cpu'):
+        try:
+            nvidia_status = subprocess.check_output(['nvidia-smi', '-i', args.device])
+            print("Using GPU device " + args.device + ". Device status:")
+            print(nvidia_status.decode('utf-8'))
+        except Exception:
+            print('Cannot get status of GPU device ' + args.device + ' using nvidia-smi.'
+                'Please check that the device is available and that nvidia-smi is installed.')
+            sys.exit(1)
+
+    # For GPU systems
+    hdbet_device_settings = ['-device', args.device, '-mode', 'accurate', '-tta', '1']
+
+    if (args.device == 'cpu'):
+        print('Warning: CPU mode is many times slower than GPU mode, and results may be suboptimal.')
+        hdbet_device_settings = ['-device', args.device, '-mode', 'fast', '-tta', '0']
+
+    # accept input as participants or sessions
+    # if given participants, look for available sessions and make a list of all sessions for each participant
+    # If given sessions as {participant},{session}, use those
+
+    if args.participant is None and args.session is None:
+        print("Either --participant or --session must be specified")
         sys.exit(1)
 
-# For GPU systems
-hdbet_device_settings = ['-device', args.device, '-mode', 'accurate', '-tta', '1']
-
-if (args.device == 'cpu'):
-    print('Warning: CPU mode is many times slower than GPU mode, and results may be suboptimal.')
-    hdbet_device_settings = ['-device', args.device, '-mode', 'fast', '-tta', '0']
-
-# accept input as participants or sessions
-# if given participants, look for available sessions and make a list of all sessions for each participant
-# If given sessions as {participant},{session}, use those
-
-if args.participant is None and args.session is None:
-    print("Either --participant or --session must be specified")
-    sys.exit(1)
-
-if args.participant is not None and args.session is not None:
-    print("Only one of --participant or --session can be specified")
-    sys.exit(1)
+    if args.participant is not None and args.session is not None:
+        print("Only one of --participant or --session can be specified")
+        sys.exit(1)
 
 
-input_dataset_dir = args.input_dataset
-output_dataset_dir = args.output_dataset
+    input_dataset_dir = args.input_dataset
+    output_dataset_dir = args.output_dataset
 
-participant_sessions = []
+    participant_sessions = []
 
-# List maximum possible combination of subject,session,image for all errors
-pipeline_error_list = []
+    # List maximum possible combination of subject,session,image for all errors
+    pipeline_error_list = []
 
-if args.participant is not None:
-    if os.path.isfile(args.participant):
-        with open(args.participant, 'r') as file_in:
-            participants = [line.rstrip() for line in file_in]
-    else:
-        participants = [ args.participant ]
-
-    for participant in participants:
-        # Get list of sessions for this participant
-        try:
-            sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
-                if f.is_dir() and f.name.startswith('ses-')]
-            if len(sessions) == 0:
-                print(f"No sessions found for participant {participant}")
-                pipeline_error_list.append(f"sub-{participant}")
-                continue
-            participant_sessions.extend([participant, session] for session in sessions)
-        except FileNotFoundError:
-            print(f"Participant {participant} not found in input dataset {input_dataset_dir}")
-else:
-    if os.path.isfile(args.session):
-        with open(args.session, 'r') as file_in:
-            participant_sessions = [line.rstrip().split(',') for line in file_in]
-    else:
-        participant_sessions = [args.session.split(',')]
-
-# Make this under system TMPDIR, cleaned up automatically
-base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='t1wpreproc.tmpdir')
-base_working_dir = base_working_dir_tmpdir.name
-
-# Get BIDS dataset name
-with open(f"{input_dataset_dir}/dataset_description.json", 'r') as file_in:
-    input_dataset_json = json.load(file_in)
-
-input_dataset_name = input_dataset_json['Name']
-
-# Check if output bids dir exists, and if not, create it
-if not os.path.isdir(output_dataset_dir):
-    os.makedirs(output_dataset_dir)
-
-    # Write dataset_description.json
-    # Can't get too descriptive on the pipeline description as we can't be sure what version of this
-    # pipeline will be used in some later run. But can at least say what it is
-    output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0',
-                             'DatasetType': 'derivative', 'PipelineDescription': {'Name': 'T1wPreprocessing',
-                             'CodeURL': 'https://github.com/ftdc-picsl/T1wPreprocessing'}}
-
-    # Write json to output dataset
-    with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
-        json.dump(output_ds_description, file_out, indent=2, sort_keys=True)
-
-# Lots of paths here, use the following naming conventions:
-# _full_path - full path to file
-# _ds_rel_path - path relative to input dataset
-# _image - image file name
-# _source_entities - BIDS file name entities for source image, create derivatives by appending to this
-
-for participant,sess in participant_sessions:
-
-    print(f"Processing participant {participant}, session {sess}")
-
-    working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{participant}_{sess}.tmpdir")
-    working_dir = working_dir_tmpdir.name
-
-    session_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}")
-
-    try:
-        t1w_images = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
-                if f.is_file() and f.name.endswith('_T1w.nii.gz')]
-    except FileNotFoundError:
-        print(f"Participant {participant} Session {sess} not found in input dataset {input_dataset_dir}")
-        pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
-        continue
-
-    if len(t1w_images) == 0:
-        print(f"No T1w images found for participant {participant} session {sess}")
-        pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
-        continue
-
-    for t1w_image in t1w_images:
-
-        t1w_full_path = os.path.join(session_full_path, 'anat', t1w_image)
-
-        # Want this relative to input data set, will be the source data in output sidecars
-        t1w_ds_rel_path = os.path.relpath(t1w_full_path, input_dataset_dir)
-
-        print(f"Processing {t1w_image}")
-
-        match = re.match('(.*)_T1w\.nii\.gz$', t1w_image)
-
-        t1w_source_entities = match.group(1)
-
-        output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
-
-        # Output preprocessed T1w
-        output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
-        # Output mask
-        output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
-
-        # Check for existing mask
-        if os.path.exists(output_mask_full_path):
-            print(f"Mask already exists: {output_mask_full_path}")
-            continue
-
-        output_mask_dir = os.path.dirname(output_mask_full_path)
-
-        if not os.path.isdir(output_mask_dir):
-            os.makedirs(output_mask_dir)
-
-        # Conform input to LPI orientation and write to temp dir
-        tmp_t1w = os.path.join(working_dir, 'hdBetInput.nii.gz')
-        tmp_output_t1w = os.path.join(working_dir, 'hdBetOutput.nii.gz')
-        # This is determined by hd-bet based on tmp_output_t1w
-        tmp_mask = os.path.join(working_dir, 'hdBetOutput_mask.nii.gz')
-
-        subprocess.run(['c3d', t1w_full_path, '-swapdim', 'LPI', '-o', tmp_t1w])
-
-        pipeline_error = False
-
-        # Now call hd-bet
-        hd_bet_cmd = ['hd-bet', '-i', tmp_t1w, '-o', tmp_output_t1w, '-b', '0', '-s',
-                        '1', '-pp', '1']
-        hd_bet_cmd.extend(hdbet_device_settings)
-        result = subprocess.run(hd_bet_cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            print(f"Error running hd-bet on {t1w_image}")
-            pipeline_error = True
-
-        # For testing - output resliced image and mask without trimming
-        # shutil.copyfile(tmp_t1w, os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat',
-        #                                      f"{t1w_source_entities}_space-orig_desc-resliced_T1w.nii.gz"))
-        # shutil.copyfile(tmp_mask, os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat',
-        #                                      f"{t1w_source_entities}_space-orig_desc-brain_mask.nii.gz"))
-
-        # trim neck with c3d, reslice mask into trimmed space
-        tmp_t1w_trim = os.path.join(working_dir, 'T1wNeckTrim.nii.gz')
-        tmp_mask_trim = os.path.join(working_dir, 'T1wNeckTrim_mask.nii.gz')
-
-        result = subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, tmp_t1w, tmp_t1w_trim], check = False,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            print(f"Error trimming neck on {t1w_image}")
-            print(result.stderr)
-            pipeline_error = True
-
-        # Pad image with c3d and reslice mask to same space
-        pad_mm = 10
-        result = subprocess.run(['c3d', tmp_t1w_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
-                                f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o', tmp_t1w_trim, '-interpolation',
-                                'NearestNeighbor', tmp_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
-                                check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            print(f"Error padding image {tmp_t1w_trim}")
-            print(result.stderr)
-            pipeline_error = True
-
-        # Set origin to mask centroid - this prevents a shift in single-subject template construction
-        # because the raw origins are not set consistently
-        result = subprocess.run(['c3d', tmp_mask_trim, '-centroid'], check = False, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-        centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
-
-        match = re.search(centroid_pattern, result.stdout)
-
-        if match:
-            # Extract the values from the match
-            mask_centroid_vox = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+    if args.participant is not None:
+        if os.path.isfile(args.participant):
+            with open(args.participant, 'r') as file_in:
+                participants = [line.rstrip() for line in file_in]
         else:
-            print("Could not get centroid from mask {tmp_mask_trim}")
-            print(result.stderr)
-            pipeline_error = True
+            participants = [ args.participant ]
 
-        # Set origin to centroid for both mask and T1w
-        centroid_str = str.join('x',[str(c) for c in mask_centroid_vox]) + "vox"
-        result = subprocess.run(['c3d', tmp_t1w_trim, '-origin-voxel', centroid_str, '-o', tmp_t1w_trim,
-                                    tmp_mask_trim, '-origin-voxel', centroid_str, '-o', tmp_mask_trim],
-                                check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            print(f"Error setting origin image on {tmp_t1w_trim}")
-            print(result.stderr)
-            pipeline_error = True
+        for participant in participants:
+            # Get list of sessions for this participant
+            try:
+                sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
+                    if f.is_dir() and f.name.startswith('ses-')]
+                if len(sessions) == 0:
+                    print(f"No sessions found for participant {participant}")
+                    pipeline_error_list.append(f"sub-{participant}")
+                    continue
+                participant_sessions.extend([participant, session] for session in sessions)
+            except FileNotFoundError:
+                print(f"Participant {participant} not found in input dataset {input_dataset_dir}")
+    else:
+        if os.path.isfile(args.session):
+            with open(args.session, 'r') as file_in:
+                participant_sessions = [line.rstrip().split(',') for line in file_in]
+        else:
+            participant_sessions = [args.session.split(',')]
 
-        # In case of error, don't write output files
-        if pipeline_error:
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}/anat/{t1w_image}")
+    # Make this under system TMPDIR, cleaned up automatically
+    base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='t1wpreproc.tmpdir')
+    base_working_dir = base_working_dir_tmpdir.name
+
+    # Get BIDS dataset name
+    with open(f"{input_dataset_dir}/dataset_description.json", 'r') as file_in:
+        input_dataset_json = json.load(file_in)
+
+    input_dataset_name = input_dataset_json['Name']
+
+    # Check if output bids dir exists, and if not, create it
+    if not os.path.isdir(output_dataset_dir):
+        os.makedirs(output_dataset_dir)
+
+        # Write dataset_description.json
+        # Can't get too descriptive on the pipeline description as we can't be sure what version of this
+        # pipeline will be used in some later run. But can at least say what it is
+        output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0',
+                                'DatasetType': 'derivative', 'PipelineDescription': {'Name': 'T1wPreprocessing',
+                                'CodeURL': 'https://github.com/ftdc-picsl/T1wPreprocessing'}}
+
+        # Write json to output dataset
+        with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
+            json.dump(output_ds_description, file_out, indent=2, sort_keys=True)
+
+    # Get output dataset metadata
+    try:
+        with open(f"{output_dataset_dir}/dataset_description.json", 'r') as file_in:
+            output_dataset_json = json.load(file_in)
+            output_dataset_name = output_dataset_json['Name']
+    except (FileNotFoundError, KeyError):
+        print(f"Output dataset dir {output_dataset_dir} exists but does not contain a dataset_description.json file "
+                " with a Name field.")
+        sys.exit(1)
+
+    for participant,sess in participant_sessions:
+
+        print(f"Processing participant {participant}, session {sess}")
+
+        session_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}")
+
+        try:
+            t1w_image_file_names = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
+                    if f.is_file() and f.name.endswith('_T1w.nii.gz')]
+        except FileNotFoundError:
+            print(f"Participant {participant} Session {sess} not found in input dataset {input_dataset_dir}")
+            pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
             continue
 
-        # Now copy to output dataset and make sidecars
-        shutil.copyfile(tmp_t1w_trim, output_t1w_full_path)
-        shutil.copyfile(tmp_mask_trim, output_mask_full_path)
+        if len(t1w_image_file_names) == 0:
+            print(f"No T1w images found for participant {participant} session {sess}")
+            pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
+            continue
 
-        output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
-        output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
-        with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
-            json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+        for t1w_image_file_name in t1w_image_file_names:
 
-        output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
-        output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
-        with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
-            json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+            match = re.match('(.*)_T1w\.nii\.gz$', t1w_image_file_name)
 
-    # Clean up working dir
-    working_dir_tmpdir.cleanup()
+            t1w_source_entities = match.group(1)
 
-print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
+            working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{t1w_source_entities}.tmpdir")
+            working_dir = working_dir_tmpdir.name
 
-# Print list of errors
-if len(pipeline_error_list) > 0:
-    print("Total errors: " + str(len(pipeline_error_list)))
-    print("Errors occurred on the following subjects / sessions / images:")
-    for error_img in pipeline_error_list:
-        print(error_img)
-else:
-    print("Total errors: 0")
+            print(f"Processing {t1w_image_file_name}")
+
+            t1w_full_path = os.path.join(session_full_path, 'anat', t1w_image_file_name)
+
+            # Want this relative to input data set, will be the source data in output sidecars
+            t1w_ds_rel_path = os.path.relpath(t1w_full_path, input_dataset_dir)
+
+            output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
+
+            # Output preprocessed T1w
+            output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
+            # Output mask
+            output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
+
+            # Check for existing mask
+            if os.path.exists(output_mask_full_path):
+                print(f"Mask already exists: {output_mask_full_path}")
+                continue
+
+            output_mask_dir = os.path.dirname(output_mask_full_path)
+
+            if not os.path.isdir(output_mask_dir):
+                os.makedirs(output_mask_dir)
+
+            pipeline_error = False
+
+            hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
+
+            pipeline_error = pipeline_error or hdbet_results['pipeline_error']
+
+            trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
+
+            pipeline_error = pipeline_error or trim_results['pipeline_error']
+
+            output_t1w_image = trim_results['output_image']
+            output_mask_image = trim_results['output_mask']
+
+            if (args.reset_origin):
+                reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
+                output_t1w_image = reset_origin_results['output_image']
+                output_mask_image = reset_origin_results['output_mask']
+                pipeline_error = pipeline_error or reset_origin_results['pipeline_error']
+
+            # Use the trimmed region image and the hdbet mask to make QC images
+            qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
+                                     trim_results['trim_region_input_space'], working_dir)
+            pipeline_error = pipeline_error or qc_data['pipeline_error']
+
+            # Get mask volume in the trimmed space - just in case there's any small differences
+            # due to reslicing
+            mask_vol = get_mask_volume(output_mask_image)
+            pipeline_error = pipeline_error or mask_vol['pipeline_error']
+
+            # In case of error, don't write output files
+            if pipeline_error:
+                pipeline_error_list.append(t1w_ds_rel_path)
+
+                print(f"Error processing {t1w_ds_rel_path}")
+                if (args.keep_workdir != 'never'):
+                    print("Copying working directory to output for debugging")
+                    # copy workingdir to output dir
+                    output_working_dir = os.path.join(output_anat_dir_full_path, 'workdir')
+                    shutil.copytree(working_dir, output_working_dir)
+                else:
+                    # Write qc image if the file exists
+                    if os.path.exists(qc_data['qc_rgb_png']):
+                        output_qc_image = os.path.join(output_anat_dir_full_path,
+                                                       f"{t1w_source_entities}_desc-qcslice_rgb.png")
+                        shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
+                continue
+
+            # Copy preprocessed images and masks to output dataset and make sidecars
+            shutil.copyfile(output_t1w_image, output_t1w_full_path)
+            shutil.copyfile(output_mask_image, output_mask_full_path)
+
+            output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
+            output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
+            with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
+                json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+
+            output_t1w_ds_rel_path = os.path.relpath(output_t1w_full_path, output_dataset_dir)
+            output_mask_ds_rel_path = os.path.relpath(output_mask_full_path, output_dataset_dir)
+
+            output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}",
+                                        f"bids:{output_dataset_name}:{output_t1w_ds_rel_path}"],
+                                        'Volume': mask_vol['volume_ml'], 'VolumeUnit': 'ml'}
+            output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
+            with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
+                json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+
+            output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
+            shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
+
+            # Copy working dir to output dir if requested
+            if args.keep_workdir == 'always':
+                print("Copying working directory to output")
+                # copy workingdir to output dir
+                output_working_dir = os.path.join(output_anat_dir_full_path, 'workdir')
+                shutil.copytree(working_dir, output_working_dir)
+
+            # Clean up working dir
+            working_dir_tmpdir.cleanup()
+
+    print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
+
+    # Print list of errors
+    if len(pipeline_error_list) > 0:
+        print("Total errors: " + str(len(pipeline_error_list)))
+        print("Errors occurred on the following subjects / sessions / images:")
+        for error_img in pipeline_error_list:
+            print(error_img)
+    else:
+        print("Total errors: 0")
+
+if __name__ == "__main__":
+    main()
