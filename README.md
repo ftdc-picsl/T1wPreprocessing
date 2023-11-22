@@ -5,11 +5,30 @@ Container for pre-processing T1w data before running structural analyses.
 Images are available on [Docker
 Hub](https://hub.docker.com/repository/docker/cookpa/ftdc-t1w-preproc/general).
 
+It is highly recommended to run with a GPU, so that the 'accurate' mode of HD-BET can be
+used. Run time for accurate mode on a GPU is still much less than for 'fast' mode on the
+CPU. Multi-threading for the CPU may be controlled by the `OMP_NUM_THREADS` environment
+variable.
+
+
 ## Input
 
-Input is a BIDS dataset and a list of participants. All sessions and T1w images under
-`anat/` will be processed, but existing preprocessed images and masks will not be
-overwritten.
+Input is a BIDS dataset and a list of participants or sessions.
+
+### Participant input
+
+For example `--participant 123456` or `--participant-list participants.txt`.
+
+All sessions and T1w images under `anat/` will be processed, but existing preprocessed
+images and masks will not be overwritten. The participant list should be a list of subject
+labels without the `sub-` prefix.
+
+
+### Session input
+
+For example `--session 123456,MR1` for `sub-123456/ses-MR1` or `--session-list
+sessions.txt` for a list of sessions, one per line, in CSV format. Only selected sessions
+wil be processed.
 
 
 ## Preprocessing steps
@@ -21,57 +40,17 @@ overwritten.
 
 2. Compute a brain mask with HD-BET.
 
-3. Trim the neck with the `trim_neck.sh` script.
+3. Trim the neck with the `trim_neck.sh` script. Resample brain mask into the trimmed space.
 
-4. Set the origin of the trimmed T1w and brain mask to the centroid of the brain mask.
+4. (optional) set the origin of the trimmed T1w and brain mask to the centroid of the
+   brain mask (off by default).
+
+5. Generate QC image.
 
 
 ## Output
 
 Output is to a BIDS derivatives dataset. The preprocessed T1w (`_desc-preproc_T1w.nii.gz`)
 and brain mask (`_desc-brain_mask.nii.gz`) are written to the `anat` folder of the
-session, with links to the source data in their respective sidecars.
-
-
-## Usage
-
-Output of `docker run --rm -it cookpa/ftdc-t1w-preproc:latest --help`
-
-```
-usage: HD-BET brain extraction and additional preprocessing --input-dataset INPUT_DATASET --output-dataset OUTPUT_DATASET [-h] [--device DEVICE] [--participant PARTICIPANT] [--session SESSION]
-
-Wrapper for brain extraction using using HD-BET followed by neck trimming with c3d. Images will be
-reoriented to LPI orientation before processing.
-
-Input can either be by participant or by session. By participant:
-
-   '--participant 01'
-   '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
-
-All available sessions will be processed for each participant. To process selected sessions:
-
-    '--session 01,MR1'
-    '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
-
-Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
-    _desc-brain_mask.nii.gz - brain mask
-    _desc-preproc_T1w.nii.gz - preprocessed T1w image
-
-If the output dataset does not exist, it will be created.
-
-Required arguments:
-  --input-dataset INPUT_DATASET
-                        Input BIDS dataset dir, containing the source images
-  --output-dataset OUTPUT_DATASET
-                        Output BIDS dataset dir
-
-Optional arguments:
-  -h, --help            show this help message and exit
-  --device DEVICE       GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower
-  --participant PARTICIPANT, --participant-list PARTICIPANT
-                        Participant to process, or a text file containing a list of participants
-  --session SESSION, --session-list SESSION
-                        Session to process, in the format 'participant,session' or a text file containing a list of
-                        participants and sessions.
-
-```
+session, with links to the source data in their respective sidecars. A QC PNG is created
+showing the trimmed region and the brain mask on the original data.

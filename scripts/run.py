@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 
 # WIP: refactor subprocess calls to support optional verbose output
 __verbose__ = False
@@ -18,21 +19,30 @@ __verbose__ = False
 #   pipeline_error = run_command(['c3d', my_image, '-swapdim', output_orientation, '-o', reoriented_image])
 #
 def run_command(cmd):
-    result = subprocess.run(cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Just to be clear we use the global var set by the main function
+    global __verbose__
 
     if (__verbose__):
-        print("--- command ---")
+        print(f"--- Running {cmd[0]} ---")
         print(" ".join(cmd))
-        print("--- end command ---")
-        print("--- command output ---")
+
+    result = subprocess.run(cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if (__verbose__):
+        print("--- command stdout ---")
         print(result.stdout)
-        print("--- end command output ---")
+        print("--- command stderr ---")
+        print(result.stderr)
+        print(f"--- end {cmd[0]} ---")
 
     if result.returncode != 0:
         print(f"Error running command: {' '.join(cmd)}")
-        print(result.stdout)
+        traceback.print_stack()
+        if not __verbose__: # print output if not already printed
+            print('command stdout:\n' + result.stdout)
+            print('command stderr:\n' + result.stderr)
 
-    return { 'success': result.returncode == 0, 'cmd_str': ' '.join(cmd), 'stdout': result.stdout }
+    return { 'error': result.returncode != 0, 'cmd_str': ' '.join(cmd), 'stderr': result.stderr, 'stdout': result.stdout }
 
 # Reset image and mask origin to mask centroid
 #
@@ -40,34 +50,31 @@ def run_command(cmd):
 #
 def reset_origin(input_image, input_mask, working_dir):
 
+    pipeline_error = False
+
     output_image = os.path.join(working_dir, 'inputOriginReset.nii.gz')
     output_mask = os.path.join(working_dir, 'inputOriginReset_mask.nii.gz')
 
     # Set origin to mask centroid - this prevents a shift in single-subject template construction
     # because the raw origins are not set consistently across sessions or protocols
-    result = subprocess.run(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
+    result = run_command(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
 
-    match = re.search(centroid_pattern, result.stdout)
+    match = re.search(centroid_pattern, result['stdout'])
 
     if match:
-    # Extract the values from the match
+        # Extract the values from the match
         mask_centroid_vox = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
     else:
         print("Could not get centroid from mask {input_mask}")
-        print(result.stderr)
         pipeline_error = True
 
     # Set origin to centroid for both mask and T1w
     centroid_str = str.join('x',[str(c) for c in mask_centroid_vox]) + "vox"
-    result = subprocess.run(['c3d', input_image, '-origin-voxel', centroid_str, '-o', output_image,
-                                input_mask, '-origin-voxel', centroid_str, '-type', 'uchar', '-o', output_mask],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error setting origin image on {tmp_t1w_trim}")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', input_image, '-origin-voxel', centroid_str, '-o', output_image,
+                                input_mask, '-origin-voxel', centroid_str, '-type', 'uchar', '-o', output_mask])
+    pipeline_error = pipeline_error or result['error']
 
     return { 'output_image': output_image, 'output_mask': output_mask, 'pipeline_error': pipeline_error }
 
@@ -94,16 +101,17 @@ def tile_images(image_files, output_path):
     total_width = sum(img.width for img in zero_filled_images)
 
     # Create a new blank image to stitch the images together
-    result = Image.new('RGB', (total_width, max_height), color='black')
+    stitched = Image.new('RGB', (total_width, max_height), color='black')
 
     # Paste the zero-filled images onto the new image from left to right
     current_width = 0
     for img in zero_filled_images:
-        result.paste(img, (current_width, 0))
+        stitched.paste(img, (current_width, 0))
         current_width += img.width
 
     # Save the result
-    result.save(output_path)
+    stitched.save(output_path)
+
 
 # QC using c3d. Inputs in the untrimmed space (we QC both neck trimming and brain masking)
 #
@@ -121,28 +129,19 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
     # Make a combined mask of the brain mask and the trimmed region
     combined_mask = os.path.join(working_dir, 'combined_mask.nii.gz')
     # Multiply brain mask by 2 to make it brighter, then add to trimmed region
-    result = subprocess.run(['c3d', brain_mask, '-scale', '2', trim_region_mask, '-add', '-o', combined_mask],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error combining brain mask and trimmed region")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', brain_mask, '-scale', '2', trim_region_mask, '-add', '-o', combined_mask])
+    pipeline_error = pipeline_error or result['error']
 
     # The result should be a mask with 3 for voxels in the brain, and 1 for voxels in the trimmed region but
     # outside the brain. Use this to make a plot of the brain mask on the T1w image
 
     # Volume of mask in mm^3
-    result = subprocess.run(['c3d', combined_mask, '-dup', '-lstat'], check = False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error getting mask stats")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', combined_mask, '-dup', '-lstat'])
+    pipeline_error = pipeline_error or result['error']
 
     # Parse output for labels 2 and 3 - 2 should not exist, if it does, it implies the brain mask is
     # outside the trimmed region
-    lstats = [line.lstrip() for line in result.stdout.splitlines()]
+    lstats = [line.lstrip() for line in result['stdout'].splitlines()]
     label2_found = False
     label3_found = False
     label3_volume = 0
@@ -154,12 +153,10 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
 
     if label2_found:
         print(f"Neck trimming error: brain mask extends outside trimmed region")
-        print(result.stderr)
         pipeline_error = True
 
     if not label3_found:
         print(f"Brain masking error: no brain voxels inside trimmed T1w space")
-        print(result.stderr)
         pipeline_error = True
 
     # Make an RGB image of the trim and brain mask on the T1w image
@@ -181,20 +178,15 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
     qc_rgb_slices = os.path.join(working_dir, 'qc_rgb_slices.png')
 
     # slice the overlay image for QC - output coronal and sagittal slice
-    result = subprocess.run(['c3d', '-type', 'uchar', full_coverage_t1w, '-stretch', '0', '99%', '0', '250', '-clip', '0', '255',
+    result = run_command(['c3d', '-type', 'uchar', full_coverage_t1w, '-stretch', '0', '99%', '0', '250', '-clip', '0', '255',
                              '-as', 'gray', '-slice', 'x', '50%', '-popas', 'gslice_sag', '-push', 'gray', '-slice', 'y',
                             '50%', '-popas', 'gslice_cor', combined_mask, '-as', 'mask', '-slice', 'x', '50%', '-popas',
                             'mslice_sag', '-push', 'mask', '-slice', 'y', '50%', '-popas', 'mslice_cor', '-clear', '-push',
                             'gslice_cor', '-push', 'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1',
                             '-clear', '-push', 'gslice_sag', '-push', 'mslice_sag', '-foreach', '-flip', 'xy', '-endfor',
                             '-oli', color_lut, '1', '-omc', qc_sag_slice, '-clear', '-push', 'gslice_cor', '-push',
-                            'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1', '-omc', qc_cor_slice],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error making QC RGB image")
-        print(result.stderr)
-        pipeline_error = True
+                            'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1', '-omc', qc_cor_slice])
+    pipeline_error = pipeline_error or result['error']
 
     # tile the slices left-right into a single image
     tile_images([qc_sag_slice, qc_cor_slice], qc_rgb_slices)
@@ -225,10 +217,8 @@ def run_hdbet(input_image, working_dir, hdbet_device_settings):
     # Conform input to orientation and write to temp dir
     reoriented_image = os.path.join(working_dir, f"input_reoriented_{output_orientation}.nii.gz")
 
-    result = subprocess.run(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
-    if result.returncode != 0:
-        print(f"Error reorienting {input_image}")
-        pipeline_error = True
+    result = run_command(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
+    pipeline_error = pipeline_error or result['error']
 
     # This isn't actually written because we use the -b 0 option to hd-bet
     tmp_output_image = os.path.join(working_dir, 'hdBetOutput.nii.gz')
@@ -241,10 +231,8 @@ def run_hdbet(input_image, working_dir, hdbet_device_settings):
                     '1', '-pp', '1']
     hd_bet_cmd.extend(hdbet_device_settings)
 
-    result = subprocess.run(hd_bet_cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error running hd-bet on {input_image}")
-        pipeline_error = True
+    result = run_command(hd_bet_cmd)
+    pipeline_error = pipeline_error or result['error']
 
     return { 'reoriented_image': reoriented_image, 'mask': tmp_mask, 'pipeline_error': pipeline_error }
 
@@ -270,23 +258,15 @@ def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
     # and 0 for voxels outside the trimmed region. Used for QC
     tmp_trim_region_image = os.path.join(working_dir, 'T1wNeckTrim_region.nii.gz')
 
-    result = subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
-                            tmp_image_trim], check = False,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error trimming neck on {input_image}")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
+                            tmp_image_trim])
+    pipeline_error = pipeline_error or result['error']
 
     # Pad image with c3d and reslice mask to same space
-    result = subprocess.run(['c3d', tmp_image_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
+    result = run_command(['c3d', tmp_image_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
                             f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o', tmp_image_trim, '-interpolation',
-                            'NearestNeighbor', input_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error padding image {tmp_image_trim}")
-        print(result.stderr)
-        pipeline_error = True
+                            'NearestNeighbor', input_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim])
+    pipeline_error = pipeline_error or result['error']
 
     return { 'output_image': tmp_image_trim, 'output_mask': tmp_mask_trim, 'trim_region_input_space': tmp_trim_region_image,
             'pipeline_error': pipeline_error }
@@ -301,17 +281,12 @@ def get_mask_volume(mask_image):
 
     pipeline_error = False
 
-    result = subprocess.run(['c3d', mask_image, '-voxel-integral'], check = False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error getting mask stats")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', mask_image, '-voxel-integral'])
+    pipeline_error = pipeline_error or result['error']
 
     # Parse output to get volume
     # Expected output example: Voxel Integral: 1.14778e+07
-    volume = float(result.stdout.splitlines()[0].split()[2])
+    volume = float(result['stdout'].splitlines()[0].split()[2])
 
     # Convert to ml
     volume_ml = volume / 1000
@@ -319,10 +294,18 @@ def get_mask_volume(mask_image):
     return { 'volume_ml': volume_ml, 'pipeline_error': pipeline_error }
 
 
+# Helps with CLI help formatting
+class RawDefaultsHelpFormatter(
+    argparse.RawTextHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
+):
+    pass
+
 def main():
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-                                    prog="HD-BET brain extraction and additional preprocessing", add_help = False,
+    global __verbose__
+
+    parser = argparse.ArgumentParser(formatter_class=RawDefaultsHelpFormatter,
+                                    add_help = False,
                                     description='''Wrapper for brain extraction using using HD-BET followed by neck
                                     trimming with c3d. Images will be reoriented to LPI orientation before processing.
 
@@ -360,8 +343,11 @@ def main():
     optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
     optional.add_argument("--keep-workdir", help="Copy working directory to output, for debugging purposes. Either 'never', "
                           " 'on_error', or 'always'.", type=str, default='on_error')
-    optional.add_argument("--verbose", help="Verbose output (not yet implemented)", action='store_true')
+    optional.add_argument("--verbose", help="Verbose output", action='store_true')
+
     args = parser.parse_args()
+
+    __verbose__ = args.verbose
 
     # Check for the existence of the nvidia controller
     if (args.device != 'cpu'):
