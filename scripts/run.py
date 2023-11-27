@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import traceback
+# For QC
+from PIL import Image
 
 # Controls verbosity of subcommands
 __verbose__ = False
@@ -88,8 +90,6 @@ def reset_origin(input_image, input_mask, working_dir):
 
 # Helper function for QC images
 def tile_images(image_files, output_path):
-
-    from PIL import Image
 
     # Load the images from the provided paths
     images = [Image.open(file) for file in image_files]
