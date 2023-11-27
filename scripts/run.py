@@ -8,31 +8,55 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
+# For QC
+from PIL import Image
 
-# WIP: refactor subprocess calls to support optional verbose output
+# Controls verbosity of subcommands
 __verbose__ = False
 
+# Catches pipeline errors from helper functions
+class PipelineError(Exception):
+    """Exception raised when helper functions encounter an error"""
+    pass
+
 # Uses subprocess.run to run a command, and prints the command and output if verbose is set
-# returns a boolean indicating whether the command succeeded
+#
 # Example:
-#   pipeline_error = run_command(['c3d', my_image, '-swapdim', output_orientation, '-o', reoriented_image])
+#   result = run_command(['c3d', my_image, '-swapdim', output_orientation, '-o', reoriented_image])
+#
+# Input: a list of command line arguments
+#
+# Returns a dictionary with keys 'cmd_str', 'stderr', 'stdout'
+#
+# Raises PipelineError if the command returns a non-zero exit code
 #
 def run_command(cmd):
-    result = subprocess.run(cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Just to be clear we use the global var set by the main function
+    global __verbose__
 
     if (__verbose__):
-        print("--- command ---")
+        print(f"--- Running {cmd[0]} ---")
         print(" ".join(cmd))
-        print("--- end command ---")
-        print("--- command output ---")
+
+    result = subprocess.run(cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if (__verbose__):
+        print("--- command stdout ---")
         print(result.stdout)
-        print("--- end command output ---")
+        print("--- command stderr ---")
+        print(result.stderr)
+        print(f"--- end {cmd[0]} ---")
 
     if result.returncode != 0:
         print(f"Error running command: {' '.join(cmd)}")
-        print(result.stdout)
+        traceback.print_stack()
+        if not __verbose__: # print output if not already printed
+            print('command stdout:\n' + result.stdout)
+            print('command stderr:\n' + result.stderr)
+            raise PipelineError(f"Error running command: {' '.join(cmd)}")
 
-    return { 'success': result.returncode == 0, 'cmd_str': ' '.join(cmd), 'stdout': result.stdout }
+    return { 'cmd_str': ' '.join(cmd), 'stderr': result.stderr, 'stdout': result.stdout }
 
 # Reset image and mask origin to mask centroid
 #
@@ -45,36 +69,27 @@ def reset_origin(input_image, input_mask, working_dir):
 
     # Set origin to mask centroid - this prevents a shift in single-subject template construction
     # because the raw origins are not set consistently across sessions or protocols
-    result = subprocess.run(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
+    result = run_command(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
 
-    match = re.search(centroid_pattern, result.stdout)
+    match = re.search(centroid_pattern, result['stdout'])
 
     if match:
-    # Extract the values from the match
+        # Extract the values from the match
         mask_centroid_vox = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
     else:
-        print("Could not get centroid from mask {input_mask}")
-        print(result.stderr)
-        pipeline_error = True
+        raise PipelineError("Could not get centroid from mask {input_mask}")
 
     # Set origin to centroid for both mask and T1w
     centroid_str = str.join('x',[str(c) for c in mask_centroid_vox]) + "vox"
-    result = subprocess.run(['c3d', input_image, '-origin-voxel', centroid_str, '-o', output_image,
-                                input_mask, '-origin-voxel', centroid_str, '-type', 'uchar', '-o', output_mask],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error setting origin image on {tmp_t1w_trim}")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', input_image, '-origin-voxel', centroid_str, '-o', output_image,
+                                input_mask, '-origin-voxel', centroid_str, '-type', 'uchar', '-o', output_mask])
 
-    return { 'output_image': output_image, 'output_mask': output_mask, 'pipeline_error': pipeline_error }
+    return { 'output_image': output_image, 'output_mask': output_mask }
 
 # Helper function for QC images
 def tile_images(image_files, output_path):
-
-    from PIL import Image
 
     # Load the images from the provided paths
     images = [Image.open(file) for file in image_files]
@@ -94,20 +109,21 @@ def tile_images(image_files, output_path):
     total_width = sum(img.width for img in zero_filled_images)
 
     # Create a new blank image to stitch the images together
-    result = Image.new('RGB', (total_width, max_height), color='black')
+    stitched = Image.new('RGB', (total_width, max_height), color='black')
 
     # Paste the zero-filled images onto the new image from left to right
     current_width = 0
     for img in zero_filled_images:
-        result.paste(img, (current_width, 0))
+        stitched.paste(img, (current_width, 0))
         current_width += img.width
 
     # Save the result
-    result.save(output_path)
+    stitched.save(output_path)
+
 
 # QC using c3d. Inputs in the untrimmed space (we QC both neck trimming and brain masking)
 #
-# If the brain mask is blank or extends outside the trim region, pipeline_error will be set to True
+# If the brain mask is blank or extends outside the trim region, qc_failure will be set to True
 #
 # Inputs:
 #   full_coverage_t1w - the original T1w image, reoriented to LPI (returned from run_hdbet)
@@ -115,37 +131,26 @@ def tile_images(image_files, output_path):
 #   trim_region - a mask in the original space containing 1 for voxels in the trimmed region and 0 for voxels outside
 #   working_dir - the working directory
 #
-# Returns: dictionary with keys 'qc_rgb_png', 'pipeline_error'
+# Returns: dictionary with keys 'qc_rgb_png', 'qc_failure'
 def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
-    pipeline_error = False
+    qc_failure = False
     # Make a combined mask of the brain mask and the trimmed region
     combined_mask = os.path.join(working_dir, 'combined_mask.nii.gz')
     # Multiply brain mask by 2 to make it brighter, then add to trimmed region
-    result = subprocess.run(['c3d', brain_mask, '-scale', '2', trim_region_mask, '-add', '-o', combined_mask],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error combining brain mask and trimmed region")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', brain_mask, '-scale', '2', trim_region_mask, '-add', '-o', combined_mask])
 
     # The result should be a mask with 3 for voxels in the brain, and 1 for voxels in the trimmed region but
     # outside the brain. Use this to make a plot of the brain mask on the T1w image
 
     # Volume of mask in mm^3
-    result = subprocess.run(['c3d', combined_mask, '-dup', '-lstat'], check = False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error getting mask stats")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', combined_mask, '-dup', '-lstat'])
 
     # Parse output for labels 2 and 3 - 2 should not exist, if it does, it implies the brain mask is
     # outside the trimmed region
-    lstats = [line.lstrip() for line in result.stdout.splitlines()]
+    lstats = [line.lstrip() for line in result['stdout'].splitlines()]
     label2_found = False
     label3_found = False
-    label3_volume = 0
+
     for lstat in lstats:
         if lstat.startswith('2'):
             label2_found = True
@@ -154,13 +159,11 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
 
     if label2_found:
         print(f"Neck trimming error: brain mask extends outside trimmed region")
-        print(result.stderr)
-        pipeline_error = True
+        qc_failure = True
 
     if not label3_found:
         print(f"Brain masking error: no brain voxels inside trimmed T1w space")
-        print(result.stderr)
-        pipeline_error = True
+        qc_failure = True
 
     # Make an RGB image of the trim and brain mask on the T1w image
     # Need to rescale T1w to range 0-255, then overlay colors
@@ -181,25 +184,19 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
     qc_rgb_slices = os.path.join(working_dir, 'qc_rgb_slices.png')
 
     # slice the overlay image for QC - output coronal and sagittal slice
-    result = subprocess.run(['c3d', '-type', 'uchar', full_coverage_t1w, '-stretch', '0', '99%', '0', '250', '-clip', '0', '255',
+    result = run_command(['c3d', '-type', 'uchar', full_coverage_t1w, '-stretch', '0', '99%', '0', '250', '-clip', '0', '255',
                              '-as', 'gray', '-slice', 'x', '50%', '-popas', 'gslice_sag', '-push', 'gray', '-slice', 'y',
                             '50%', '-popas', 'gslice_cor', combined_mask, '-as', 'mask', '-slice', 'x', '50%', '-popas',
                             'mslice_sag', '-push', 'mask', '-slice', 'y', '50%', '-popas', 'mslice_cor', '-clear', '-push',
                             'gslice_cor', '-push', 'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1',
                             '-clear', '-push', 'gslice_sag', '-push', 'mslice_sag', '-foreach', '-flip', 'xy', '-endfor',
                             '-oli', color_lut, '1', '-omc', qc_sag_slice, '-clear', '-push', 'gslice_cor', '-push',
-                            'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1', '-omc', qc_cor_slice],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error making QC RGB image")
-        print(result.stderr)
-        pipeline_error = True
+                            'mslice_cor', '-foreach', '-flip', 'xy', '-endfor', '-oli', color_lut, '1', '-omc', qc_cor_slice])
 
     # tile the slices left-right into a single image
     tile_images([qc_sag_slice, qc_cor_slice], qc_rgb_slices)
 
-    return { 'qc_rgb_png': qc_rgb_slices, 'pipeline_error': pipeline_error }
+    return { 'qc_rgb_png': qc_rgb_slices, 'qc_failure': qc_failure }
 
 
 # Runs preprocessing and HD-BET brain extraction
@@ -218,17 +215,12 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
 # Returns: dictionary with keys 'reoriented_image', 'mask', 'pipeline_error'
 def run_hdbet(input_image, working_dir, hdbet_device_settings):
 
-    pipeline_error = False
-
     output_orientation = 'LPI'
 
     # Conform input to orientation and write to temp dir
     reoriented_image = os.path.join(working_dir, f"input_reoriented_{output_orientation}.nii.gz")
 
-    result = subprocess.run(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
-    if result.returncode != 0:
-        print(f"Error reorienting {input_image}")
-        pipeline_error = True
+    result = run_command(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
 
     # This isn't actually written because we use the -b 0 option to hd-bet
     tmp_output_image = os.path.join(working_dir, 'hdBetOutput.nii.gz')
@@ -241,12 +233,9 @@ def run_hdbet(input_image, working_dir, hdbet_device_settings):
                     '1', '-pp', '1']
     hd_bet_cmd.extend(hdbet_device_settings)
 
-    result = subprocess.run(hd_bet_cmd, check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error running hd-bet on {input_image}")
-        pipeline_error = True
+    result = run_command(hd_bet_cmd)
 
-    return { 'reoriented_image': reoriented_image, 'mask': tmp_mask, 'pipeline_error': pipeline_error }
+    return { 'reoriented_image': reoriented_image, 'mask': tmp_mask }
 
 
 # Trim the neck from the image, and pad with empty space on all sides.
@@ -270,26 +259,15 @@ def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
     # and 0 for voxels outside the trimmed region. Used for QC
     tmp_trim_region_image = os.path.join(working_dir, 'T1wNeckTrim_region.nii.gz')
 
-    result = subprocess.run(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
-                            tmp_image_trim], check = False,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error trimming neck on {input_image}")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
+                            tmp_image_trim])
 
     # Pad image with c3d and reslice mask to same space
-    result = subprocess.run(['c3d', tmp_image_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
+    result = run_command(['c3d', tmp_image_trim, '-pad', f"{pad_mm}x{pad_mm}x{pad_mm}mm",
                             f"{pad_mm}x{pad_mm}x{pad_mm}mm", '0', '-o', tmp_image_trim, '-interpolation',
-                            'NearestNeighbor', input_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim],
-                            check = False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        print(f"Error padding image {tmp_image_trim}")
-        print(result.stderr)
-        pipeline_error = True
+                            'NearestNeighbor', input_mask, '-reslice-identity', '-type', 'uchar', '-o', tmp_mask_trim])
 
-    return { 'output_image': tmp_image_trim, 'output_mask': tmp_mask_trim, 'trim_region_input_space': tmp_trim_region_image,
-            'pipeline_error': pipeline_error }
+    return { 'output_image': tmp_image_trim, 'output_mask': tmp_mask_trim, 'trim_region_input_space': tmp_trim_region_image }
 
 
 #
@@ -301,28 +279,30 @@ def get_mask_volume(mask_image):
 
     pipeline_error = False
 
-    result = subprocess.run(['c3d', mask_image, '-voxel-integral'], check = False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
-        print(f"Error getting mask stats")
-        print(result.stderr)
-        pipeline_error = True
+    result = run_command(['c3d', mask_image, '-voxel-integral'])
 
     # Parse output to get volume
     # Expected output example: Voxel Integral: 1.14778e+07
-    volume = float(result.stdout.splitlines()[0].split()[2])
+    volume = float(result['stdout'].splitlines()[0].split()[2])
 
     # Convert to ml
     volume_ml = volume / 1000
 
-    return { 'volume_ml': volume_ml, 'pipeline_error': pipeline_error }
+    return { 'volume_ml': volume_ml }
 
+
+# Helps with CLI help formatting
+class RawDefaultsHelpFormatter(
+    argparse.RawTextHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
+):
+    pass
 
 def main():
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-                                    prog="HD-BET brain extraction and additional preprocessing", add_help = False,
+    global __verbose__
+
+    parser = argparse.ArgumentParser(formatter_class=RawDefaultsHelpFormatter,
+                                    add_help = False,
                                     description='''Wrapper for brain extraction using using HD-BET followed by neck
                                     trimming with c3d. Images will be reoriented to LPI orientation before processing.
 
@@ -360,8 +340,11 @@ def main():
     optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
     optional.add_argument("--keep-workdir", help="Copy working directory to output, for debugging purposes. Either 'never', "
                           " 'on_error', or 'always'.", type=str, default='on_error')
-    optional.add_argument("--verbose", help="Verbose output (not yet implemented)", action='store_true')
+    optional.add_argument("--verbose", help="Verbose output", action='store_true')
+
     args = parser.parse_args()
+
+    __verbose__ = args.verbose
 
     # Check for the existence of the nvidia controller
     if (args.device != 'cpu'):
@@ -442,6 +425,7 @@ def main():
     if not os.path.isdir(output_dataset_dir):
         os.makedirs(output_dataset_dir)
 
+    if not os.path.exists(os.path.join(output_dataset_dir, 'dataset_description.json')):
         # Write dataset_description.json
         # Can't get too descriptive on the pipeline description as we can't be sure what version of this
         # pipeline will be used in some later run. But can at least say what it is
@@ -459,8 +443,7 @@ def main():
             output_dataset_json = json.load(file_in)
             output_dataset_name = output_dataset_json['Name']
     except (FileNotFoundError, KeyError):
-        print(f"Output dataset dir {output_dataset_dir} exists but does not contain a dataset_description.json file "
-                " with a Name field.")
+        print(f"Output dataset name is required, please check {output_dataset_dir}/data_description.json")
         sys.exit(1)
 
     for participant,sess in participant_sessions:
@@ -515,37 +498,30 @@ def main():
             if not os.path.isdir(output_mask_dir):
                 os.makedirs(output_mask_dir)
 
-            pipeline_error = False
+            try:
+                hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
 
-            hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
+                trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
 
-            pipeline_error = pipeline_error or hdbet_results['pipeline_error']
+                output_t1w_image = trim_results['output_image']
+                output_mask_image = trim_results['output_mask']
 
-            trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
+                if (args.reset_origin):
+                    reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
+                    output_t1w_image = reset_origin_results['output_image']
+                    output_mask_image = reset_origin_results['output_mask']
 
-            pipeline_error = pipeline_error or trim_results['pipeline_error']
+                # Use the trimmed region image and the hdbet mask to make QC images
+                qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
+                                        trim_results['trim_region_input_space'], working_dir)
 
-            output_t1w_image = trim_results['output_image']
-            output_mask_image = trim_results['output_mask']
+                if qc_data['qc_failure']:
+                    raise(PipelineError("QC failure"))
 
-            if (args.reset_origin):
-                reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
-                output_t1w_image = reset_origin_results['output_image']
-                output_mask_image = reset_origin_results['output_mask']
-                pipeline_error = pipeline_error or reset_origin_results['pipeline_error']
-
-            # Use the trimmed region image and the hdbet mask to make QC images
-            qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
-                                     trim_results['trim_region_input_space'], working_dir)
-            pipeline_error = pipeline_error or qc_data['pipeline_error']
-
-            # Get mask volume in the trimmed space - just in case there's any small differences
-            # due to reslicing
-            mask_vol = get_mask_volume(output_mask_image)
-            pipeline_error = pipeline_error or mask_vol['pipeline_error']
-
-            # In case of error, don't write output files
-            if pipeline_error:
+                # Get mask volume in the trimmed space - just in case there's any small differences
+                # due to reslicing
+                mask_vol = get_mask_volume(output_mask_image)
+            except PipelineError:
                 pipeline_error_list.append(t1w_ds_rel_path)
 
                 print(f"Error processing {t1w_ds_rel_path}")
@@ -554,12 +530,12 @@ def main():
                     # copy workingdir to output dir
                     output_working_dir = os.path.join(output_anat_dir_full_path, 'workdir')
                     shutil.copytree(working_dir, output_working_dir)
-                else:
-                    # Write qc image if the file exists
-                    if os.path.exists(qc_data['qc_rgb_png']):
-                        output_qc_image = os.path.join(output_anat_dir_full_path,
-                                                       f"{t1w_source_entities}_desc-qcslice_rgb.png")
-                        shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
+
+                # Write qc image if the file exists
+                if os.path.exists(qc_data['qc_rgb_png']):
+                    output_qc_image = os.path.join(output_anat_dir_full_path,
+                                                    f"{t1w_source_entities}_desc-qcslice_rgb.png")
+                    shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
                 continue
 
             # Copy preprocessed images and masks to output dataset and make sidecars
