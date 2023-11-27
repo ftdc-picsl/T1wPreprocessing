@@ -259,7 +259,7 @@ def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
     # and 0 for voxels outside the trimmed region. Used for QC
     tmp_trim_region_image = os.path.join(working_dir, 'T1wNeckTrim_region.nii.gz')
 
-    result = run_command(['trim_neck.sh', '-d', '-c', '10', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
+    result = run_command(['trim_neck.sh', '-d', '-c', '20', '-w', working_dir, '-m', tmp_trim_region_image, input_image,
                             tmp_image_trim])
 
     # Pad image with c3d and reslice mask to same space
