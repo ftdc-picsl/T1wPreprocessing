@@ -15,6 +15,39 @@ from PIL import Image
 # Controls verbosity of subcommands
 __verbose__ = False
 
+# Get a dictionary for the GeneratedBy field for the BIDS dataset_description.json
+# This is used to record the software used to generate the dataset
+# The environment variables DOCKER_IMAGE_TAG and DOCKER_IMAGE_VERSION are used if set
+#
+# Container type is assumed to be "docker" unless the variable SINGULARITY_CONTAINER
+# is defined
+def get_generated_by(existing_generated_by=None):
+
+    import copy
+
+    generated_by = []
+
+    if existing_generated_by is not None:
+        generated_by = copy.deepcopy(existing_generated_by)
+        for gb in existing_generated_by:
+            if gb['Name'] == 'T1wPreprocessing' and gb['Container']['Tag'] == os.environ.get('DOCKER_IMAGE_TAG'):
+                # Don't overwrite existing generated_by if it's already set to this pipeline
+                return generated_by
+
+    container_type = 'docker'
+
+    if 'SINGULARITY_CONTAINER' in os.environ:
+        container_type = 'singularity'
+
+    gen_dict = {'Name': 'T1wPreprocessing',
+                'Version': os.environ.get('DOCKER_IMAGE_VERSION', 'unknown'),
+                'CodeURL': os.environ.get('GIT_REMOTE', 'unknown'),
+                'Container': {'Type': container_type, 'Tag': os.environ.get('DOCKER_IMAGE_TAG', 'unknown')}
+                }
+
+    generated_by.append(gen_dict)
+    return generated_by
+
 # Catches pipeline errors from helper functions
 class PipelineError(Exception):
     """Exception raised when helper functions encounter an error"""
@@ -430,14 +463,29 @@ def main():
         # Can't get too descriptive on the pipeline description as we can't be sure what version of this
         # pipeline will be used in some later run. But can at least say what it is
         output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0',
-                                'DatasetType': 'derivative', 'PipelineDescription': {'Name': 'T1wPreprocessing',
-                                'CodeURL': 'https://github.com/ftdc-picsl/T1wPreprocessing'}}
+                                'DatasetType': 'derivative', 'GeneratedBy': get_generated_by()
+                                }
 
         # Write json to output dataset
         with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
             json.dump(output_ds_description, file_out, indent=2, sort_keys=True)
+    else:
+        # Get output dataset metadata
+        try:
+            with open(f"{output_dataset_dir}/dataset_description.json", 'r') as file_in:
+                output_dataset_json = json.load(file_in)
+            # If this container doesn't already exist in the generated_by list, it will be added
+            generated_by = get_generated_by(output_dataset_json['GeneratedBy'])
+            # If we updated the generated_by, write it back to the output dataset
+            old_gen_by = output_dataset_json['GeneratedBy']
+            if old_gen_by is None or len(generated_by) > len(old_gen_by):
+                output_dataset_json['GeneratedBy'] = generated_by
+                with open(f"{output_dataset_dir}/dataset_description.json", 'w') as file_out:
+                    json.dump(output_dataset_json, file_out, indent=2, sort_keys=True)
+        except (FileNotFoundError, KeyError):
+            print(f"Output dataset name is required, please check {output_dataset_dir}/data_description.json")
+            sys.exit(1)
 
-    # Get output dataset metadata
     try:
         with open(f"{output_dataset_dir}/dataset_description.json", 'r') as file_in:
             output_dataset_json = json.load(file_in)
