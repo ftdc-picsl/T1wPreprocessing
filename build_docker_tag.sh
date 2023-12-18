@@ -33,24 +33,28 @@ if [[ -z "$gitTag" ]]; then
     exit 1
 fi
 
-dockerTag=${gitTag:1}
-
-if [[ ! "v${dockerTag}" == "${gitTag}" ]]; then
-    echo "Tag $dockerTag does not match git tag $gitTag"
+# Check that the git tag satisfies the format vX.Y.Z
+if [[ ! $gitTag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Tag $gitTag does not match vX.Y.Z format"
     exit 1
 fi
 
-# Put this in docker labels
-dockerCommit=$gitTag
+dockerVersion=${gitTag:1}
+
+dockerTag="cookpa/ftdc-t1w-preproc:${dockerVersion}"
 
 # Build the docker image
-docker build -t "ftdc-t1w-preproc:$dockerTag" . --build-arg GIT_REMOTE="$gitRemote" --build-arg GIT_COMMIT="$gitTag"
+docker build -t "$dockerTag" . \
+    --build-arg GIT_REMOTE="$gitRemote" \
+    --build-arg GIT_COMMIT="$gitTag" \
+    --build-arg DOCKER_IMAGE_TAG="$dockerTag" \
+    --build-arg DOCKER_IMAGE_VERSION="$dockerVersion"
 
 if [[ $? -ne 0 ]] ; then
     echo "Docker build failed - see output above"
     exit 1
 else
     echo
-    echo "Build successful: ftdc-t1w-preproc:$dockerTag"
+    echo "Build successful: $dockerTag"
     echo
 fi
