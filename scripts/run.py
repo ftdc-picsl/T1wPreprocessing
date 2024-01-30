@@ -460,7 +460,9 @@ def main():
 
     if not os.path.exists(os.path.join(output_dataset_dir, 'dataset_description.json')):
         # Write dataset_description.json
-        output_ds_description = {'Name': input_dataset_name + '_T1wpreprocessed', 'BIDSVersion': '1.8.0',
+        output_dataset_name = input_dataset_name + '_T1wpreprocessed'
+
+        output_ds_description = {'Name': output_dataset_name, 'BIDSVersion': '1.8.0',
                                 'DatasetType': 'derivative', 'GeneratedBy': get_generated_by()
                                 }
 
