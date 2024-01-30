@@ -102,8 +102,7 @@ def reset_origin(input_image, input_mask, working_dir):
 
     # Set origin to mask centroid - this prevents a shift in single-subject template construction
     # because the raw origins are not set consistently across sessions or protocols
-    result = run_command(['c3d', input_mask, '-centroid'], check = False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+    result = run_command(['c3d', input_mask, '-centroid'])
     centroid_pattern = r'CENTROID_VOX \[([\d\.-]+), ([\d\.-]+), ([\d\.-]+)\]'
 
     match = re.search(centroid_pattern, result['stdout'])
