@@ -93,7 +93,7 @@ def run_command(cmd):
 
 # Reset image and mask origin to mask centroid
 #
-# Returns: dictionary with keys 'output_image', 'output_mask', 'pipeline_error'
+# Returns: dictionary with keys 'output_image', 'output_mask'
 #
 def reset_origin(input_image, input_mask, working_dir):
 
@@ -244,7 +244,7 @@ def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
 #   working_dir - the working directory
 #   hdbet_device_settings - a list of hd-bet settings e.g. ['-device', '0', '-mode', 'fast', '-tta', '0']
 #
-# Returns: dictionary with keys 'reoriented_image', 'mask', 'pipeline_error'
+# Returns: dictionary with keys 'reoriented_image', 'mask'
 def run_hdbet(input_image, working_dir, hdbet_device_settings):
 
     output_orientation = 'LPI'
@@ -282,7 +282,6 @@ def run_hdbet(input_image, working_dir, hdbet_device_settings):
 #   pad_mm - number of mm to pad on each side after trimming
 #
 def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
-    pipeline_error = False
     # trim neck with c3d, reslice mask into trimmed space
     tmp_image_trim = os.path.join(working_dir, 'T1wNeckTrim.nii.gz')
     tmp_mask_trim = os.path.join(working_dir, 'T1wNeckTrim_mask.nii.gz')
@@ -308,8 +307,6 @@ def trim_neck(input_image, input_mask, working_dir, pad_mm=10):
 # Returns: float containing the volume in mm^3
 #
 def get_mask_volume(mask_image):
-
-    pipeline_error = False
 
     result = run_command(['c3d', mask_image, '-voxel-integral'])
 
