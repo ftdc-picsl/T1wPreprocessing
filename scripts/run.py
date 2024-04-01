@@ -160,12 +160,19 @@ def tile_images(image_files, output_path):
 # Inputs:
 #   full_coverage_t1w - the original T1w image, reoriented to LPI (returned from run_hdbet)
 #   brain_mask - the brain mask from hd-bet, in the untrimmed space
-#   trim_region - a mask in the original space containing 1 for voxels in the trimmed region and 0 for voxels outside
+#   trim_region - a mask in the original space containing 1 for voxels in the trimmed region and 0 for voxels outside.
+#                 If None (neck trimming is turned off), the trimmed region encompasses the entire T1w image
 #   working_dir - the working directory
 #
 # Returns: dictionary with keys 'qc_rgb_png', 'qc_failure'
-def get_qc_data(full_coverage_t1w, brain_mask, trim_region_mask, working_dir):
+def get_qc_data(full_coverage_t1w, brain_mask, working_dir, trim_region_mask=None):
     qc_failure = False
+
+    if trim_region_mask is None:
+        # If trim region is None, it means the entire T1w image is the trimmed region
+        trim_region_mask = os.path.join(working_dir, 'full_coverage_mask.nii.gz')
+        result = run_command(['c3d', full_coverage_t1w, '-thresh', '0', '0', '1', '1', '-o', trim_region_mask])
+
     # Make a combined mask of the brain mask and the trimmed region
     combined_mask = os.path.join(working_dir, 'combined_mask.nii.gz')
     # Multiply brain mask by 2 to make it brighter, then add to trimmed region
@@ -367,8 +374,10 @@ def main():
     optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
                           "text file containing a list of participants and sessions.", type=str)
     optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
+    optional.add_argument("--trim-neck", help="Trim neck from image", action='store_true')
     optional.add_argument("--keep-workdir", help="Copy working directory to output, for debugging purposes. Either 'never', "
-                          " 'on_error', or 'always'.", type=str, default='on_error')
+                          " 'on_error', or 'always'.", choices=['never', 'on_error', 'always'], type=str.lower,
+                          default='on_error')
     optional.add_argument("--verbose", help="Verbose output", action='store_true')
 
     args = parser.parse_args()
@@ -542,25 +551,30 @@ def main():
             try:
                 hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
 
-                trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
+                output_t1w_image = hdbet_results['reoriented_image']
+                output_mask_image = hdbet_results['mask']
 
-                output_t1w_image = trim_results['output_image']
-                output_mask_image = trim_results['output_mask']
+                qc_data = None
+
+                if (args.trim_neck):
+                    trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
+                    output_t1w_image = trim_results['output_image']
+                    output_mask_image = trim_results['output_mask']
+                    # Use the trimmed region image and the hdbet mask to make QC images
+                    qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
+                                          working_dir, trim_results['trim_region_input_space'])
+                else:
+                    qc_data = get_qc_data(output_t1w_image, output_mask_image, working_dir)
 
                 if (args.reset_origin):
                     reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
                     output_t1w_image = reset_origin_results['output_image']
                     output_mask_image = reset_origin_results['output_mask']
 
-                # Use the trimmed region image and the hdbet mask to make QC images
-                qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
-                                        trim_results['trim_region_input_space'], working_dir)
-
                 if qc_data['qc_failure']:
                     raise(PipelineError("QC failure"))
 
-                # Get mask volume in the trimmed space - just in case there's any small differences
-                # due to reslicing
+                # Get mask volume in the trimmed space - just in case there's any small differences due to reslicing
                 mask_vol = get_mask_volume(output_mask_image)
             except PipelineError:
                 pipeline_error_list.append(t1w_ds_rel_path)
