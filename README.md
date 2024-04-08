@@ -40,9 +40,9 @@ wil be processed.
 
 2. Compute a brain mask with HD-BET.
 
-3. Trim the neck with the `trim_neck.sh` script. Resample brain mask into the trimmed space.
+3. (optional) Trim the neck with the `trim_neck.sh` script. Resample brain mask into the trimmed space.
 
-4. (optional) set the origin of the trimmed T1w and brain mask to the centroid of the
+4. (optional) Set the origin of the trimmed T1w and brain mask to the centroid of the
    brain mask (off by default).
 
 5. Generate QC image.
