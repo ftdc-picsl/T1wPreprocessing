@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import filelock
 import json
 import os
 import re
@@ -461,39 +462,46 @@ def main():
 
     # Check if output bids dir exists, and if not, create it
     if not os.path.isdir(output_dataset_dir):
-        os.makedirs(output_dataset_dir)
+        os.makedirs(output_dataset_dir, exist_ok=True)
 
-    if not os.path.exists(os.path.join(output_dataset_dir, 'dataset_description.json')):
-        # Write dataset_description.json
-        output_dataset_name = input_dataset_name + '_T1wpreprocessed'
+    # Update dataset_description.json if needed
+    lock_file = os.path.join(output_dataset_dir, 't1wpreprocessing_dataset_metadata.lock')
 
-        output_ds_description = {'Name': output_dataset_name, 'BIDSVersion': '1.8.0',
-                                'DatasetType': 'derivative', 'GeneratedBy': get_generated_by()
-                                }
+    if os.path.exists(lock_file):
+        print(f"WARNING: lock file exists in dataset {output_dataset_dir}. Will wait for it to be released.")
 
-        # Write json to output dataset
-        with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
-            json.dump(output_ds_description, file_out, indent=2, sort_keys=True)
-    else:
-        # Get output dataset metadata
-        try:
-            with open(f"{output_dataset_dir}/dataset_description.json", 'r') as file_in:
-                output_dataset_json = json.load(file_in)
-            # If this container doesn't already exist in the generated_by list, it will be added
-            if 'GeneratedBy' in output_dataset_json:
-                generated_by = get_generated_by(output_dataset_json['GeneratedBy'])
-            else:
-                generated_by = get_generated_by()
-            # If we updated the generated_by, write it back to the output dataset
-            output_dataset_name = output_dataset_json['Name']
-            old_gen_by = output_dataset_json['GeneratedBy']
-            if old_gen_by is None or len(generated_by) > len(old_gen_by):
-                output_dataset_json['GeneratedBy'] = generated_by
-                with open(f"{output_dataset_dir}/dataset_description.json", 'w') as file_out:
-                    json.dump(output_dataset_json, file_out, indent=2, sort_keys=True)
-        except (FileNotFoundError, KeyError):
-            raise ValueError(f"Output dataset Name is required, please check "
-                             f"{output_dataset_dir}/data_description.json")
+    with filelock.SoftFileLock(lock_file, timeout=30):
+        if not os.path.exists(os.path.join(output_dataset_dir, 'dataset_description.json')):
+            # Write dataset_description.json
+            output_dataset_name = input_dataset_name + '_T1wpreprocessed'
+
+            output_ds_description = {'Name': output_dataset_name, 'BIDSVersion': '1.8.0',
+                                    'DatasetType': 'derivative', 'GeneratedBy': get_generated_by()
+                                    }
+
+            # Write json to output dataset
+            with open(os.path.join(output_dataset_dir, 'dataset_description.json'), 'w') as file_out:
+                json.dump(output_ds_description, file_out, indent=2, sort_keys=True)
+        else:
+            # Get output dataset metadata
+            try:
+                with open(f"{output_dataset_dir}/dataset_description.json", 'r') as file_in:
+                    output_dataset_json = json.load(file_in)
+                # If this container doesn't already exist in the generated_by list, it will be added
+                if 'GeneratedBy' in output_dataset_json:
+                    generated_by = get_generated_by(output_dataset_json['GeneratedBy'])
+                else:
+                    generated_by = get_generated_by()
+                # If we updated the generated_by, write it back to the output dataset
+                output_dataset_name = output_dataset_json['Name']
+                old_gen_by = output_dataset_json['GeneratedBy']
+                if old_gen_by is None or len(generated_by) > len(old_gen_by):
+                    output_dataset_json['GeneratedBy'] = generated_by
+                    with open(f"{output_dataset_dir}/dataset_description.json", 'w') as file_out:
+                        json.dump(output_dataset_json, file_out, indent=2, sort_keys=True)
+            except (FileNotFoundError, KeyError):
+                raise ValueError(f"Output dataset Name is required, please check "
+                                f"{output_dataset_dir}/data_description.json")
 
 
     for participant,sess in participant_sessions:
