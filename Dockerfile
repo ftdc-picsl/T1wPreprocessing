@@ -1,4 +1,4 @@
-FROM cookpa/hd-bet:0.2.2
+FROM cookpa/hd-bet:0.3.0
 
 ARG DOCKER_IMAGE_TAG="unknown"
 ARG DOCKER_IMAGE_VERSION="unknown"

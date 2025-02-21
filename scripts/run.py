@@ -266,11 +266,10 @@ def run_hdbet(input_image, working_dir, hdbet_device_settings):
     tmp_output_image = os.path.join(working_dir, 'hdBetOutput.nii.gz')
 
     # This is determined by hd-bet based on tmp_output_image
-    tmp_mask = os.path.join(working_dir, 'hdBetOutput_mask.nii.gz')
+    tmp_mask = os.path.join(working_dir, 'hdBetOutput_bet.nii.gz')
 
     # Now call hd-bet
-    hd_bet_cmd = ['hd-bet', '-i', reoriented_image, '-o', tmp_output_image, '-b', '0', '-s',
-                    '1', '-pp', '1']
+    hd_bet_cmd = ['hd-bet', '-i', reoriented_image, '-o', tmp_output_image, '--no_bet_image', '--save_bet_mask', '--verbose']
     hd_bet_cmd.extend(hdbet_device_settings)
 
     result = run_command(hd_bet_cmd)
@@ -368,8 +367,8 @@ def main():
     required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
     optional = parser.add_argument_group('Optional arguments')
     optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
-    optional.add_argument("--device", help="GPU device to use, or 'cpu' to use CPU. Note CPU mode is many times slower",
-                          type=str, default='0')
+    optional.add_argument("--device", help="GPU device to use. Supported GPUs are 'cuda', 'mps'. For cpu mode, use 'cpu'. Note "
+                          "CPU mode is many times slower and may not be as robust", type=str, default='cuda')
     optional.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a "
                           "list of participants", type=str)
     optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
@@ -387,21 +386,19 @@ def main():
 
     # Check for the existence of the nvidia controller
     if (args.device != 'cpu'):
-        try:
-            nvidia_status = subprocess.check_output(['nvidia-smi', '-i', args.device])
-            print("Using GPU device " + args.device + ". Device status:")
-            print(nvidia_status.decode('utf-8'))
-        except Exception:
-            print('Cannot get status of GPU device ' + args.device + ' using nvidia-smi.'
-                'Please check that the device is available and that nvidia-smi is installed.')
-            sys.exit(1)
+        if (args.device == 'cuda'):
+            cuda_visible_devices = os.getenv('CUDA_VISIBLE_DEVICES')
+            if not cuda_visible_devices:
+                print("CUDA_VISIBLE_DEVICES is not set. No GPUs are visible to the process.")
+                sys.exit(1)
+        elif (args.device == 'mps'):
+            print("Using Apple MPS (assuming supported GPU)")
 
-    # For GPU systems
-    hdbet_device_settings = ['-device', args.device, '-mode', 'accurate', '-tta', '1']
+    hdbet_device_settings = ['-device', args.device]
 
     if (args.device == 'cpu'):
         print('Warning: CPU mode is many times slower than GPU mode, and results may be suboptimal.')
-        hdbet_device_settings = ['-device', args.device, '-mode', 'fast', '-tta', '0']
+        hdbet_device_settings = ['-device', 'cpu', '--disable_tta']
 
     # accept input as participants or sessions
     # if given participants, look for available sessions and make a list of all sessions for each participant
