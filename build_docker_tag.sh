@@ -33,9 +33,9 @@ if [[ -z "$gitTag" ]]; then
     exit 1
 fi
 
-# Check that the git tag satisfies the format vX.Y.Z
-if [[ ! $gitTag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Tag $gitTag does not match vX.Y.Z format"
+# Check that the git tag satisfies the format vX.Y.Z or vX.Y.Z-<suffix>
+if [[ ! $gitTag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
+    echo "Tag $gitTag does not match vX.Y.Z[-suffix] format"
     exit 1
 fi
 

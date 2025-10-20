@@ -43,6 +43,11 @@ def _get_generated_by(existing_generated_by=None):
     generated_by = list()
 
     if existing_generated_by is not None:
+        if isinstance(existing_generated_by, dict):
+            existing_generated_by = [existing_generated_by]
+        elif not isinstance(existing_generated_by, list):
+            raise ValueError("existing_generated_by must be a list of dict or a dict")
+
         generated_by = copy.deepcopy(existing_generated_by)
         for gb in existing_generated_by:
             if gb['Name'] == 'T1wPreprocessing' and gb['Container']['Tag'] == os.environ.get('DOCKER_IMAGE_TAG'):
