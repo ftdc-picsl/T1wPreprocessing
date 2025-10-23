@@ -685,12 +685,12 @@ def main():
                 os.makedirs(output_mask_dir)
 
             try:
+                qc_data = None
+
                 hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
 
                 output_t1w_image = hdbet_results['reoriented_image']
                 output_mask_image = hdbet_results['mask']
-
-                qc_data = None
 
                 if (args.trim_neck):
                     trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
@@ -723,7 +723,7 @@ def main():
                     shutil.copytree(working_dir, output_working_dir)
 
                 # Write qc image if the file exists
-                if os.path.exists(qc_data['qc_rgb_png']):
+                if qc_data is not None and os.path.exists(qc_data.get('qc_rgb_png', None)):
                     output_qc_image = os.path.join(output_anat_dir_full_path,
                                                     f"{t1w_source_entities}_desc-qcslice_rgb.png")
                     shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
