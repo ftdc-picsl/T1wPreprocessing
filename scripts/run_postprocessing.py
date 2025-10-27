@@ -407,44 +407,6 @@ def get_qc_data(full_coverage_t1w, brain_mask, working_dir, trim_region_mask=Non
     return { 'qc_rgb_png': qc_rgb_slices, 'qc_failure': qc_failure }
 
 
-# Runs preprocessing and HD-BET brain extraction
-# The image will be reoriented to LPI orientation before processing - it is a requirement of HD-BET
-# that the image be "in the same orientation as the MNI template". Most structural images from dcm2niix
-# already meet this requirement.
-#
-# FSL's MNI template has a negative determinant for the transformation matrix, which dcm2niix output and
-# templateflow templates do not. But it does not appear to cause problems for HD-BET.
-#
-# Inputs:
-#   input_image - the input T1w image
-#   working_dir - the working directory
-#   hdbet_device_settings - a list of hd-bet settings e.g. ['-device', '0', '-mode', 'fast', '-tta', '0']
-#
-# Returns: dictionary with keys 'reoriented_image', 'mask'
-def run_hdbet(input_image, working_dir, hdbet_device_settings):
-
-    output_orientation = 'LPI'
-
-    # Conform input to orientation and write to temp dir
-    reoriented_image = os.path.join(working_dir, f"input_reoriented_{output_orientation}.nii.gz")
-
-    result = run_command(['c3d', input_image, '-swapdim', output_orientation, '-o', reoriented_image])
-
-    # This isn't actually written because we use the -b 0 option to hd-bet
-    tmp_output_image = os.path.join(working_dir, 'hdBetOutput.nii.gz')
-
-    # This is determined by hd-bet based on tmp_output_image
-    tmp_mask = os.path.join(working_dir, 'hdBetOutput_bet.nii.gz')
-
-    # Now call hd-bet
-    hd_bet_cmd = ['hd-bet', '-i', reoriented_image, '-o', tmp_output_image, '--no_bet_image', '--save_bet_mask', '--verbose']
-    hd_bet_cmd.extend(hdbet_device_settings)
-
-    result = run_command(hd_bet_cmd)
-
-    return { 'reoriented_image': reoriented_image, 'mask': tmp_mask }
-
-
 # Trim the neck from the image, and pad with empty space on all sides.
 # Resample the mask into the trimmed space
 # Return trimmed images plus a mask in the original space containing the trim region
@@ -507,13 +469,16 @@ def main():
 
     parser = argparse.ArgumentParser(formatter_class=RawDefaultsHelpFormatter,
                                     add_help = False,
-                                    description='''Wrapper for brain extraction using using HD-BET followed by neck
-                                    trimming with c3d. Images will be reoriented to LPI orientation before processing.
+                                    description='''Postprocesses T1-weighted images and masks.
 
-    Input can either be by participant or by session. By participant:
+    This script should be run after the 'run_prepare_input.py' and 'run_hdbet.py'.
 
-    '--participant 01'
-    '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
+    Input should be the same as that given to the 'run_prepare_input.py' script.
+
+    By participant:
+
+      '--participant 01'
+      '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
 
     All available sessions will be processed for each participant. To process selected sessions:
 
@@ -532,41 +497,22 @@ def main():
     required = parser.add_argument_group('Required arguments')
     required.add_argument("--input-dataset", help="Input BIDS dataset dir, containing the source images", type=str,
                           required=True)
+    required.add_argument("--hd-bet-input-dir", help="Directory containing preprocessed images and hd-bet masks", type=str,
+                          required=True)
     required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
     optional = parser.add_argument_group('Optional arguments')
     optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
-    optional.add_argument("--device", help="GPU device to use. Supported GPUs are 'cuda', 'mps'. For cpu mode, use 'cpu'. Note "
-                          "CPU mode is many times slower and may not be as robust", type=str, default='cuda')
     optional.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a "
                           "list of participants", type=str)
     optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
                           "text file containing a list of participants and sessions.", type=str)
     optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
     optional.add_argument("--trim-neck", help="Trim neck from image", action='store_true')
-    optional.add_argument("--keep-workdir", help="Copy working directory to output, for debugging purposes. Either 'never', "
-                          " 'on_error', or 'always'.", choices=['never', 'on_error', 'always'], type=str.lower,
-                          default='on_error')
     optional.add_argument("--verbose", help="Verbose output", action='store_true')
 
     args = parser.parse_args()
 
     __verbose__ = args.verbose
-
-    # Check for the existence of the nvidia controller
-    if (args.device != 'cpu'):
-        if (args.device == 'cuda'):
-            cuda_visible_devices = os.getenv('CUDA_VISIBLE_DEVICES')
-            if not cuda_visible_devices:
-                print("CUDA_VISIBLE_DEVICES is not set. No GPUs are visible to the process.")
-                sys.exit(1)
-        elif (args.device == 'mps'):
-            print("Using Apple MPS (assuming supported GPU)")
-
-    hdbet_device_settings = ['-device', args.device]
-
-    if (args.device == 'cpu'):
-        print('Warning: CPU mode is many times slower than GPU mode, and results may be suboptimal.')
-        hdbet_device_settings = ['-device', 'cpu', '--disable_tta']
 
     # accept input as participants or sessions
     # if given participants, look for available sessions and make a list of all sessions for each participant
@@ -579,7 +525,6 @@ def main():
     if args.participant is not None and args.session is not None:
         print("Only one of --participant or --session can be specified")
         sys.exit(1)
-
 
     input_dataset_dir = args.input_dataset
     output_dataset_dir = args.output_dataset
@@ -687,19 +632,24 @@ def main():
             try:
                 qc_data = None
 
-                hdbet_results = run_hdbet(t1w_full_path, working_dir, hdbet_device_settings)
+                conformed_t1w = os.path.join(args.hd_bet_input_dir, t1w_image_file_name)
+                hdbet_mask = conformed_t1w.replace('_T1w.nii.gz', '_T1w_bet.nii.gz')
 
-                output_t1w_image = hdbet_results['reoriented_image']
-                output_mask_image = hdbet_results['mask']
+                if not os.path.exists(conformed_t1w):
+                    raise(PipelineError(f"Conformed T1w image not found: {conformed_t1w}"))
+                if not os.path.exists(hdbet_mask):
+                    raise(PipelineError(f"HD-BET mask not found: {hdbet_mask}"))
 
                 if (args.trim_neck):
-                    trim_results = trim_neck(hdbet_results['reoriented_image'], hdbet_results['mask'], working_dir)
+                    trim_results = trim_neck(conformed_t1w, hdbet_mask, working_dir)
                     output_t1w_image = trim_results['output_image']
                     output_mask_image = trim_results['output_mask']
-                    # Use the trimmed region image and the hdbet mask to make QC images
-                    qc_data = get_qc_data(hdbet_results['reoriented_image'], hdbet_results['mask'],
+                    # Use the trimmed region image and the original hdbet mask to make QC images
+                    qc_data = get_qc_data(conformed_t1w, hdbet_mask,
                                           working_dir, trim_results['trim_region_input_space'])
                 else:
+                    output_t1w_image = conformed_t1w
+                    output_mask_image = hdbet_mask
                     qc_data = get_qc_data(output_t1w_image, output_mask_image, working_dir)
 
                 if (args.reset_origin):
@@ -716,17 +666,6 @@ def main():
                 pipeline_error_list.append(t1w_ds_rel_path)
 
                 print(f"Error processing {t1w_ds_rel_path}")
-                if (args.keep_workdir != 'never'):
-                    print("Copying working directory to output for debugging")
-                    # copy workingdir to output dir
-                    output_working_dir = os.path.join(output_anat_dir_full_path, 'workdir')
-                    shutil.copytree(working_dir, output_working_dir)
-
-                # Write qc image if the file exists
-                if qc_data is not None and os.path.exists(qc_data.get('qc_rgb_png', None)):
-                    output_qc_image = os.path.join(output_anat_dir_full_path,
-                                                    f"{t1w_source_entities}_desc-qcslice_rgb.png")
-                    shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
                 continue
 
             # Copy preprocessed images and masks to output dataset and make sidecars
@@ -749,13 +688,6 @@ def main():
 
             output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
             shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
-
-            # Copy working dir to output dir if requested
-            if args.keep_workdir == 'always':
-                print("Copying working directory to output")
-                # copy workingdir to output dir
-                output_working_dir = os.path.join(output_anat_dir_full_path, 'workdir')
-                shutil.copytree(working_dir, output_working_dir)
 
             # Clean up working dir
             working_dir_tmpdir.cleanup()
