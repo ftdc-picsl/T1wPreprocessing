@@ -23,5 +23,5 @@ ENV DOCKER_IMAGE_VERSION=$DOCKER_IMAGE_VERSION
 
 ENV PATH="/opt/bin:$PATH"
 
-ENTRYPOINT ["/opt/bin/run.py"]
+ENTRYPOINT ["/opt/bin/entrypoint.sh"]
 CMD ["-h"]
