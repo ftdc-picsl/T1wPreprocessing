@@ -4,8 +4,8 @@ function usage {
     echo "Usage: $0 [command]"
     echo "Available commands:"
     echo "  prepare_input       Prepare input data for hd-bet"
-    echo "  run_hdbet           Run hd-bet on the prepared input"
-    echo "  run_postprocessing  Run postprocessing on hd-bet output"
+    echo "  hdbet           Run hd-bet on the prepared input"
+    echo "  postprocessing  Run postprocessing on hd-bet output"
     echo
     echo "Run any command with --help for more information."
     exit 1
