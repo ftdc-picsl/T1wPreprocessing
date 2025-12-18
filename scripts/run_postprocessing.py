@@ -548,11 +548,12 @@ def main():
                     if f.is_dir() and f.name.startswith('ses-')]
                 if len(sessions) == 0:
                     print(f"No sessions found for participant {participant}")
-                    pipeline_error_list.append(f"sub-{participant}")
+                    pipeline_error_list.append(f"sub-{participant}\tNo sessions found")
                     continue
                 participant_sessions.extend([participant, session] for session in sessions)
             except FileNotFoundError:
                 print(f"Participant {participant} not found in input dataset {input_dataset_dir}")
+                pipeline_error_list.append(f"sub-{participant}\tParticipant not found")
     else:
         if os.path.isfile(args.session):
             with open(args.session, 'r') as file_in:
@@ -583,17 +584,22 @@ def main():
 
         session_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}")
 
+        if not os.path.exists(session_full_path):
+            print(f"Participant {participant} session {sess} not found in input dataset {input_dataset_dir}")
+            pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tSession not found")
+            continue
+
         try:
             t1w_image_file_names = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
                     if f.is_file() and f.name.endswith('_T1w.nii.gz')]
         except FileNotFoundError:
-            print(f"Participant {participant} Session {sess} not found in input dataset {input_dataset_dir}")
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
+            print(f"No anat directory for participant {participant} session {sess} in input dataset {input_dataset_dir}")
+            pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tanat directory not found")
             continue
 
         if len(t1w_image_file_names) == 0:
-            print(f"No T1w images found for participant {participant} session {sess}")
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}")
+            print(f"No T1w images found for participant {participant} session {sess} in input dataset {input_dataset_dir}")
+            pipeline_error_list.append(f"sub-{participant}/ses-{sess}/anat\tNo T1w images found")
             continue
 
         for t1w_image_file_name in t1w_image_file_names:
@@ -662,9 +668,8 @@ def main():
 
                 # Get mask volume in the trimmed space - just in case there's any small differences due to reslicing
                 mask_vol = get_mask_volume(output_mask_image)
-            except PipelineError:
-                pipeline_error_list.append(t1w_ds_rel_path)
-
+            except PipelineError as e:
+                pipeline_error_list.append(f"{t1w_ds_rel_path}\t{e}")
                 print(f"Error processing {t1w_ds_rel_path}")
                 continue
 
@@ -697,7 +702,7 @@ def main():
     # Print list of errors
     if len(pipeline_error_list) > 0:
         print("Total errors: " + str(len(pipeline_error_list)))
-        print("Errors occurred on the following subjects / sessions / images:")
+        print("Path\t\tError:")
         for error_img in pipeline_error_list:
             print(error_img)
     else:
