@@ -220,9 +220,6 @@ def main():
                         print(f"Found existing output for {input_t1w_fn}, skipping")
                     else:
                         t1w_image_files_to_process.append(input_t1w_fn)
-            if len(t1w_image_files_to_process) == 0:
-                print(f"All T1w images for participant {participant} session {sess} already have outputs, skipping.")
-                continue
         else:
             t1w_image_files_to_process = t1w_image_file_names
 

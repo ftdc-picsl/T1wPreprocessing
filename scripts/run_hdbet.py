@@ -64,6 +64,13 @@ def run_command(cmd):
 #
 def run_hdbet(input_directory, hdbet_device_settings, verbose=False):
 
+    # Check there are at least some NIfTI files in the input directory
+    nii_files = [f for f in os.listdir(input_directory) if f.endswith('.nii.gz')]
+
+    if len(nii_files) == 0:
+        print(f"No NIfTI files found in input directory {input_directory}")
+        return
+
     # Now call hd-bet
     hd_bet_cmd = ['hd-bet', '-i', input_directory, '-o', input_directory, '--no_bet_image', '--save_bet_mask']
     hd_bet_cmd.extend(hdbet_device_settings)
