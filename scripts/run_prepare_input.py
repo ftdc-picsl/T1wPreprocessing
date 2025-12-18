@@ -209,7 +209,7 @@ def main():
 
         t1w_image_files_to_process = list()
 
-        if args.pipeline_output_dataset is not None:
+        if args.pipeline_output_dataset is not None and os.path.isdir(args.pipeline_output_dataset):
             # Check for existing outputs in the pipeline output dataset
             pipeline_output_anat_dir = os.path.join(args.pipeline_output_dataset, f"sub-{participant}", f"ses-{sess}", 'anat')
             if os.path.exists(pipeline_output_anat_dir):
