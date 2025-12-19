@@ -99,14 +99,15 @@ def main():
         '--session 01,MR1'
         '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
 
-    Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
+    The eventual output of the pipeline is to a BIDS derivative dataset, with the following files created for each input T1w
+    image:
         _desc-brain_mask.nii.gz - brain mask
         _desc-preproc_T1w.nii.gz - preprocessed T1w image
 
-    In addition, a QC PNG image is created for each input image, showing the brain mask and the trimmed region.
+    If the option '--pipeline-output-dataset' is given, the script will check for existing outputs in that dataset and skip
+    processing for any images that already have outputs.
 
-    If the output dataset does not exist, it will be created.
-
+    The output of this script is the preprocessed T1w image, which should be passed as input to HD-BET for batch processing.
     ''')
     required = parser.add_argument_group('Required arguments')
     required.add_argument("--input-dataset", help="Input BIDS dataset dir, containing the source images", type=str,
@@ -119,6 +120,9 @@ def main():
                           "list of participants", type=str)
     optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
                           "text file containing a list of participants and sessions.", type=str)
+    optional.add_argument("--pipeline-output-dataset", help="Output BIDS derivative dataset dir, containing the final outputs "
+                          "of the pipeline. This is only used to find existing output so that we do not duplicate processing",
+                          type=str, default=None)
     optional.add_argument("--verbose", help="Verbose output", action='store_true')
 
     args = parser.parse_args()
@@ -156,8 +160,10 @@ def main():
         for participant in participants:
             # Get list of sessions for this participant
             try:
-                sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
-                    if f.is_dir() and f.name.startswith('ses-')]
+                sessions = [
+                    f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
+                    if f.is_dir() and f.name.startswith('ses-')
+                    ]
                 if len(sessions) == 0:
                     print(f"No sessions found for participant {participant}")
                     pipeline_error_list.append(f"sub-{participant}\tNo sessions found")
@@ -201,7 +207,25 @@ def main():
             pipeline_error_list.append(f"sub-{participant}/ses-{sess}/anat\tNo T1w images found")
             continue
 
-        for t1w_image_file_name in t1w_image_file_names:
+        t1w_image_files_to_process = list()
+
+        if args.pipeline_output_dataset is not None and os.path.isdir(args.pipeline_output_dataset):
+            # Check for existing outputs in the pipeline output dataset
+            pipeline_output_anat_dir = os.path.join(args.pipeline_output_dataset, f"sub-{participant}", f"ses-{sess}", 'anat')
+            if os.path.exists(pipeline_output_anat_dir):
+                for input_t1w_fn in t1w_image_file_names:
+                    output_mask_path = os.path.join(pipeline_output_anat_dir,
+                                                    input_t1w_fn.replace('_T1w.nii.gz', '_desc-brain_mask.nii.gz'))
+                    if os.path.exists(output_mask_path):
+                        print(f"Found existing output for {input_t1w_fn}, skipping")
+                    else:
+                        t1w_image_files_to_process.append(input_t1w_fn)
+            else:
+                t1w_image_files_to_process = t1w_image_file_names
+        else:
+            t1w_image_files_to_process = t1w_image_file_names
+
+        for t1w_image_file_name in t1w_image_files_to_process:
 
             if __verbose__:
                 print(f"  Processing {t1w_image_file_name}")
