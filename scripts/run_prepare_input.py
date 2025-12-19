@@ -220,6 +220,8 @@ def main():
                         print(f"Found existing output for {input_t1w_fn}, skipping")
                     else:
                         t1w_image_files_to_process.append(input_t1w_fn)
+            else:
+                t1w_image_files_to_process = t1w_image_file_names
         else:
             t1w_image_files_to_process = t1w_image_file_names
 
