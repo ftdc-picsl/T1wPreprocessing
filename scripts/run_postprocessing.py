@@ -603,39 +603,39 @@ def main():
             continue
 
         for t1w_image_file_name in t1w_image_file_names:
-
-            match = re.match('(.*)_T1w\.nii\.gz$', t1w_image_file_name)
-
-            t1w_source_entities = match.group(1)
-
-            working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{t1w_source_entities}.tmpdir")
-            working_dir = working_dir_tmpdir.name
-
-            print(f"Processing {t1w_image_file_name}")
-
-            t1w_full_path = os.path.join(session_full_path, 'anat', t1w_image_file_name)
-
-            # Want this relative to input data set, will be the source data in output sidecars
-            t1w_ds_rel_path = os.path.relpath(t1w_full_path, input_dataset_dir)
-
-            output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
-
-            # Output preprocessed T1w
-            output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
-            # Output mask
-            output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
-
-            # Check for existing mask
-            if os.path.exists(output_mask_full_path):
-                print(f"Mask already exists: {output_mask_full_path}")
-                continue
-
-            output_mask_dir = os.path.dirname(output_mask_full_path)
-
-            if not os.path.isdir(output_mask_dir):
-                os.makedirs(output_mask_dir)
-
+            working_dir_tmpdir = None
             try:
+                match = re.match('(.*)_T1w\.nii\.gz$', t1w_image_file_name)
+
+                t1w_source_entities = match.group(1)
+
+                working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{t1w_source_entities}.tmpdir")
+                working_dir = working_dir_tmpdir.name
+
+                print(f"Processing {t1w_image_file_name}")
+
+                t1w_full_path = os.path.join(session_full_path, 'anat', t1w_image_file_name)
+
+                # Want this relative to input data set, will be the source data in output sidecars
+                t1w_ds_rel_path = os.path.relpath(t1w_full_path, input_dataset_dir)
+
+                output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
+
+                # Output preprocessed T1w
+                output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
+                # Output mask
+                output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
+
+                # Check for existing mask
+                if os.path.exists(output_mask_full_path):
+                    print(f"Mask already exists: {output_mask_full_path}")
+                    continue
+
+                output_mask_dir = os.path.dirname(output_mask_full_path)
+
+                if not os.path.isdir(output_mask_dir):
+                    os.makedirs(output_mask_dir, exist_ok=True)
+
                 qc_data = None
 
                 conformed_t1w = os.path.join(args.hd_bet_input_dir, t1w_image_file_name)
@@ -668,34 +668,34 @@ def main():
 
                 # Get mask volume in the trimmed space - just in case there's any small differences due to reslicing
                 mask_vol = get_mask_volume(output_mask_image)
-            except PipelineError as e:
+
+                # Copy preprocessed images and masks to output dataset and make sidecars
+                shutil.copyfile(output_t1w_image, output_t1w_full_path)
+                shutil.copyfile(output_mask_image, output_mask_full_path)
+
+                output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
+                output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
+                with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
+                    json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+
+                output_t1w_ds_rel_path = os.path.relpath(output_t1w_full_path, output_dataset_dir)
+
+                output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}",
+                                            f"bids::{output_t1w_ds_rel_path}"],
+                                            'Volume': mask_vol['volume_ml'], 'VolumeUnit': 'ml'}
+                output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
+                with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
+                    json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
+
+                output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
+                shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
+
+            except Exception as e:
                 pipeline_error_list.append(f"{t1w_ds_rel_path}\t{e}")
-                print(f"Error processing {t1w_ds_rel_path}")
-                continue
-
-            # Copy preprocessed images and masks to output dataset and make sidecars
-            shutil.copyfile(output_t1w_image, output_t1w_full_path)
-            shutil.copyfile(output_mask_image, output_mask_full_path)
-
-            output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
-            output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
-            with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
-                json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
-
-            output_t1w_ds_rel_path = os.path.relpath(output_t1w_full_path, output_dataset_dir)
-
-            output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}",
-                                        f"bids::{output_t1w_ds_rel_path}"],
-                                        'Volume': mask_vol['volume_ml'], 'VolumeUnit': 'ml'}
-            output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
-            with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
-                json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
-
-            output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
-            shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
-
-            # Clean up working dir
-            working_dir_tmpdir.cleanup()
+                print(f'Error processing {t1w_ds_rel_path}: {e}')
+            finally:
+                if working_dir_tmpdir is not None:
+                    working_dir_tmpdir.cleanup()
 
     print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
 
