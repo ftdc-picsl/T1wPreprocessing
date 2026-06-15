@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 
 import argparse
+import csv
+import json
 import os
 import subprocess
 import sys
 import traceback
+
+from find_data import find_t1w_images_from_bids, find_t1w_images_from_filesystem, get_bids_layout
 
 # Controls verbosity of subcommands
 __verbose__ = False
@@ -99,6 +103,43 @@ def main():
         '--session 01,MR1'
         '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
 
+
+    BIDS Filtering
+    --------------
+
+    By default, a simple file system search is used in each session, returning anything under 'anat/' that ends with ]
+    '_T1w.nii.gz'.
+
+    If you want to use a more complex BIDS filter, you can use the '--bids-filter' option to specify a JSON file containing a
+    BIDS filter. Filters must have a key "t1w". The following values are required: {"datatype": "anat", "suffix": "T1w"}.
+    To include regexes in the filter, add "regex": true. Example:
+
+    {
+      "t1w": {
+        "datatype": "anat",
+        "suffix": "T1w",
+        "acquisition": "MPRAGE(-hires)?",
+        "regex_search": true,
+      }
+    }
+
+    If a BIDS filter is used, pybids is used to find the input images. This is much slower for large datasets. Validation
+    will be turned off.
+
+
+    Ranked T1w selection
+    --------------------
+
+    While the default is to process all available images, it is sometimes desirable to select a single T1w image per session.
+    For example, if there are multiple T1w images, and you want to choose the one with the highest resolution. The
+    `--acq-preference-ranks` option takes a text file (one entry per line) or comma-separated list of acquisition labels, in
+    order of preference. The script will select the first image that has an acq label exactly matching one of the available
+    options.
+
+
+    Output
+    ------
+
     The eventual output of the pipeline is to a BIDS derivative dataset, with the following files created for each input T1w
     image:
         _desc-brain_mask.nii.gz - brain mask
@@ -120,6 +161,10 @@ def main():
                           "list of participants", type=str)
     optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
                           "text file containing a list of participants and sessions.", type=str)
+    optional.add_argument("--bids-filter", help="JSON file containing a BIDS filter", type=str)
+    optional.add_argument("--acq-preference-ranks", help="Text file or comma-separated list of acquisition labels, in order of "
+                          "preference. The script will select the first image that has an acq label exactly matching one of "
+                          "the available options.", type=str)
     optional.add_argument("--pipeline-output-dataset", help="Output BIDS derivative dataset dir, containing the final outputs "
                           "of the pipeline. This is only used to find existing output so that we do not duplicate processing",
                           type=str, default=None)
@@ -147,6 +192,7 @@ def main():
     participant_sessions = []
 
     pipeline_error_list = []
+    manifest_rows = []
 
     print(f"Reading input images from dataset: {input_dataset_dir}")
 
@@ -183,6 +229,30 @@ def main():
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
+    # Not used unless user specifies a BIDS filter
+    bids_layout = None
+    bids_filter = None
+
+    acq_preference_order = None
+
+    if args.acq_preference_ranks is not None:
+        if os.path.isfile(args.acq_preference_ranks):
+            with open(args.acq_preference_ranks , 'r') as file_in:
+                acq_preference_order = [line.rstrip() for line in file_in]
+        else:
+            acq_preference_order = args.acq_preference_ranks.split(',')
+        print(f"Using acquisition preference order: {acq_preference_order}")
+        print("Only the first image matching an acquisition label in the preference order will be selected for processing")
+
+    if args.bids_filter is not None:
+        print(f"Using BIDS filter: {args.bids_filter}")
+        bids_layout = get_bids_layout(input_dataset_dir)
+        with open(args.bids_filter, 'r') as f:
+            bids_filter_json = json.load(f)
+            if 't1w' not in bids_filter_json:
+                raise ValueError(f"BIDS filter {args.bids_filter} must contain a 't1w' filter")
+            bids_filter = bids_filter_json['t1w']
+
     for participant,sess in participant_sessions:
 
         print(f"Processing participant {participant}, session {sess}")
@@ -195,8 +265,11 @@ def main():
             continue
 
         try:
-            t1w_image_file_names = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
-                    if f.is_file() and f.name.endswith('_T1w.nii.gz')]
+            if bids_layout is not None:
+                t1w_image_file_names = \
+                    find_t1w_images_from_bids(bids_layout, participant, sess, bids_filter, acq_preference_order)
+            else:
+                t1w_image_file_names = find_t1w_images_from_filesystem(session_full_path, acq_preference_order)
         except FileNotFoundError:
             print(f"No anat directory for participant {participant} session {sess} in input dataset {input_dataset_dir}")
             pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tanat directory not found")
@@ -241,6 +314,21 @@ def main():
                 pipeline_error_list.append(t1w_full_path)
                 print(f"Error processing {t1w_full_path}")
                 continue
+
+            manifest_rows.append({
+                'Participant': participant,
+                'Session': sess,
+                'T1wBasename': os.path.basename(t1w_image_file_name),
+            })
+
+    manifest_path = os.path.join(output_dir, 't1w_preproc_selected_input.csv')
+    with open(manifest_path, 'w', newline='') as manifest_file:
+        fieldnames = ['Participant', 'Session', 'T1wBasename']
+        writer = csv.DictWriter(manifest_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+
+    print(f"Wrote selected input manifest: {manifest_path}")
 
     # Print list of errors
     if len(pipeline_error_list) > 0:

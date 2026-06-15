@@ -1,0 +1,16 @@
+acres==0.5.0
+bids-validator==1.14.7.post0
+bidsschematools==1.2.2
+click==8.4.1
+docopt==0.6.2
+formulaic==1.2.2
+frozendict==2.4.7
+greenlet==3.5.1
+interface_meta==2.0.1
+narwhals==2.22.1
+num2words==0.5.14
+pathlib_abc==0.5.2
+pybids==0.22.0
+SQLAlchemy==2.0.51
+universal_pathlib==0.3.10
+wrapt==2.2.1

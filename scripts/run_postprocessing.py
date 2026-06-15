@@ -2,13 +2,13 @@
 
 import argparse
 import copy
+import csv
 import filelock
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import traceback
 # For QC
@@ -473,17 +473,8 @@ def main():
 
     This script should be run after the 'run_prepare_input.py' and 'run_hdbet.py'.
 
-    Input should be the same as that given to the 'run_prepare_input.py' script.
-
-    By participant:
-
-      '--participant 01'
-      '--participant-list subjects.txt' where the text file contains a list of participants, one per line.
-
-    All available sessions will be processed for each participant. To process selected sessions:
-
-        '--session 01,MR1'
-        '--sesion-list sessions.txt' where the text file contains a list of 'subject,session', one per line.
+    Input should be the same as that given to the 'run_prepare_input.py' script. A manifest of images to expect is written
+    to the working directory from `run_prepare_input.py`.
 
     Output is to a BIDS derivative dataset, with the following files created for each input T1w image:
         _desc-brain_mask.nii.gz - brain mask
@@ -502,10 +493,6 @@ def main():
     required.add_argument("--output-dataset", help="Output BIDS dataset dir", type=str, required=True)
     optional = parser.add_argument_group('Optional arguments')
     optional.add_argument("-h", "--help", action="help", help="show this help message and exit")
-    optional.add_argument("--participant", "--participant-list", help="Participant to process, or a text file containing a "
-                          "list of participants", type=str)
-    optional.add_argument("--session", "--session-list", help="Session to process, in the format 'participant,session' or a "
-                          "text file containing a list of participants and sessions.", type=str)
     optional.add_argument("--reset-origin", help="Reset image and mask origin to mask centroid", action='store_true')
     optional.add_argument("--trim-neck", help="Trim neck from image", action='store_true')
     optional.add_argument("--verbose", help="Verbose output", action='store_true')
@@ -514,52 +501,11 @@ def main():
 
     __verbose__ = args.verbose
 
-    # accept input as participants or sessions
-    # if given participants, look for available sessions and make a list of all sessions for each participant
-    # If given sessions as {participant},{session}, use those
-
-    if args.participant is None and args.session is None:
-        print("Either --participant or --session must be specified")
-        sys.exit(1)
-
-    if args.participant is not None and args.session is not None:
-        print("Only one of --participant or --session can be specified")
-        sys.exit(1)
-
     input_dataset_dir = args.input_dataset
     output_dataset_dir = args.output_dataset
 
-    participant_sessions = []
-
     # List maximum possible combination of subject,session,image for all errors
     pipeline_error_list = []
-
-    if args.participant is not None:
-        if os.path.isfile(args.participant):
-            with open(args.participant, 'r') as file_in:
-                participants = [line.rstrip() for line in file_in]
-        else:
-            participants = [ args.participant ]
-
-        for participant in participants:
-            # Get list of sessions for this participant
-            try:
-                sessions = [f.name.replace('ses-', '') for f in os.scandir(os.path.join(input_dataset_dir, f"sub-{participant}"))
-                    if f.is_dir() and f.name.startswith('ses-')]
-                if len(sessions) == 0:
-                    print(f"No sessions found for participant {participant}")
-                    pipeline_error_list.append(f"sub-{participant}\tNo sessions found")
-                    continue
-                participant_sessions.extend([participant, session] for session in sessions)
-            except FileNotFoundError:
-                print(f"Participant {participant} not found in input dataset {input_dataset_dir}")
-                pipeline_error_list.append(f"sub-{participant}\tParticipant not found")
-    else:
-        if os.path.isfile(args.session):
-            with open(args.session, 'r') as file_in:
-                participant_sessions = [line.rstrip().split(',') for line in file_in]
-        else:
-            participant_sessions = [args.session.split(',')]
 
     # Make this under system TMPDIR, cleaned up automatically
     base_working_dir_tmpdir = tempfile.TemporaryDirectory(suffix='t1wpreproc.tmpdir')
@@ -578,124 +524,123 @@ def main():
     # Update dataset_description.json if needed
     update_output_dataset(output_dataset_dir, f"{input_dataset_name} T1w Preprocessed", [input_dataset_dir])
 
-    for participant,sess in participant_sessions:
+    # Read list of images to process
+    input_image_manifest = os.path.join(args.hd_bet_input_dir, 't1w_preproc_selected_input.csv')
 
-        print(f"Processing participant {participant}, session {sess}")
+    input_to_process = list()
 
-        session_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}")
+    # Read t1w_preproc_selected_input into tuples of (participant, session, t1w_image_file_name)
+    if not os.path.exists(input_image_manifest):
+        raise FileNotFoundError(f"Input manifest not found: {input_image_manifest}")
 
-        if not os.path.exists(session_full_path):
-            print(f"Participant {participant} session {sess} not found in input dataset {input_dataset_dir}")
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tSession not found")
+    with open(input_image_manifest, 'r', newline='') as file_in:
+        manifest_reader = csv.DictReader(file_in)
+        expected_fieldnames = ['Participant', 'Session', 'T1wBasename']
+        if manifest_reader.fieldnames != expected_fieldnames:
+            raise ValueError(f"Unexpected header in input manifest {input_image_manifest}, expected "
+                             f"{','.join(expected_fieldnames)}, got {manifest_reader.fieldnames}")
+
+        for row in manifest_reader:
+            input_to_process.append((row['Participant'], row['Session'], row['T1wBasename']))
+
+
+    for participant, sess, t1w_image_file_name in input_to_process:
+        working_dir_tmpdir = None
+        match = re.match(r'(.*)_T1w\.nii\.gz$', t1w_image_file_name)
+        if not match:
+            raise ValueError(f"Unexpected T1w image file name {t1w_image_file_name}, expected to match pattern "
+                                '(.*)_T1w.nii.gz')
+        t1w_source_entities = match.group(1)
+
+        print(f"Processing {t1w_image_file_name}")
+
+        t1w_input_full_path = os.path.join(input_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat',
+                                           t1w_image_file_name)
+
+        # Want this relative to input data set, will be the source data in output sidecars
+        t1w_ds_rel_path = os.path.relpath(t1w_input_full_path, input_dataset_dir)
+
+        output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
+
+        # Output preprocessed T1w
+        output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
+        # Output mask
+        output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
+
+        # Check for existing mask
+        if os.path.exists(output_mask_full_path):
+            print(f"Mask already exists: {output_mask_full_path}")
             continue
 
         try:
-            t1w_image_file_names = [f.name for f in os.scandir(os.path.join(session_full_path, 'anat'))
-                    if f.is_file() and f.name.endswith('_T1w.nii.gz')]
-        except FileNotFoundError:
-            print(f"No anat directory for participant {participant} session {sess} in input dataset {input_dataset_dir}")
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tanat directory not found")
-            continue
+            working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{t1w_source_entities}.tmpdir")
+            working_dir = working_dir_tmpdir.name
 
-        if len(t1w_image_file_names) == 0:
-            print(f"No T1w images found for participant {participant} session {sess} in input dataset {input_dataset_dir}")
-            pipeline_error_list.append(f"sub-{participant}/ses-{sess}/anat\tNo T1w images found")
-            continue
+            output_mask_dir = os.path.dirname(output_mask_full_path)
 
-        for t1w_image_file_name in t1w_image_file_names:
-            working_dir_tmpdir = None
-            try:
-                match = re.match('(.*)_T1w\.nii\.gz$', t1w_image_file_name)
+            if not os.path.isdir(output_mask_dir):
+                os.makedirs(output_mask_dir, exist_ok=True)
 
-                t1w_source_entities = match.group(1)
+            qc_data = None
 
-                working_dir_tmpdir = tempfile.TemporaryDirectory(dir=base_working_dir, suffix=f"_{t1w_source_entities}.tmpdir")
-                working_dir = working_dir_tmpdir.name
+            conformed_t1w = os.path.join(args.hd_bet_input_dir, t1w_image_file_name)
+            hdbet_mask = conformed_t1w.replace('_T1w.nii.gz', '_T1w_bet.nii.gz')
 
-                print(f"Processing {t1w_image_file_name}")
+            if not os.path.exists(conformed_t1w):
+                raise(PipelineError(f"Conformed T1w image not found: {conformed_t1w}"))
+            if not os.path.exists(hdbet_mask):
+                raise(PipelineError(f"HD-BET mask not found: {hdbet_mask}"))
 
-                t1w_full_path = os.path.join(session_full_path, 'anat', t1w_image_file_name)
+            if (args.trim_neck):
+                trim_results = trim_neck(conformed_t1w, hdbet_mask, working_dir)
+                output_t1w_image = trim_results['output_image']
+                output_mask_image = trim_results['output_mask']
+                # Use the trimmed region image and the original hdbet mask to make QC images
+                qc_data = get_qc_data(conformed_t1w, hdbet_mask,
+                                        working_dir, trim_results['trim_region_input_space'])
+            else:
+                output_t1w_image = conformed_t1w
+                output_mask_image = hdbet_mask
+                qc_data = get_qc_data(output_t1w_image, output_mask_image, working_dir)
 
-                # Want this relative to input data set, will be the source data in output sidecars
-                t1w_ds_rel_path = os.path.relpath(t1w_full_path, input_dataset_dir)
+            if (args.reset_origin):
+                reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
+                output_t1w_image = reset_origin_results['output_image']
+                output_mask_image = reset_origin_results['output_mask']
 
-                output_anat_dir_full_path = os.path.join(output_dataset_dir, f"sub-{participant}", f"ses-{sess}", 'anat')
+            if qc_data['qc_failure']:
+                raise(PipelineError("QC failure"))
 
-                # Output preprocessed T1w
-                output_t1w_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-preproc_T1w.nii.gz")
-                # Output mask
-                output_mask_full_path = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-brain_mask.nii.gz")
+            # Get mask volume in the trimmed space - just in case there's any small differences due to reslicing
+            mask_vol = get_mask_volume(output_mask_image)
 
-                # Check for existing mask
-                if os.path.exists(output_mask_full_path):
-                    print(f"Mask already exists: {output_mask_full_path}")
-                    continue
+            # Copy preprocessed images and masks to output dataset and make sidecars
+            shutil.copyfile(output_t1w_image, output_t1w_full_path)
+            shutil.copyfile(output_mask_image, output_mask_full_path)
 
-                output_mask_dir = os.path.dirname(output_mask_full_path)
+            output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
+            output_t1w_sidecar_full_path = re.sub(r'\.nii\.gz$', '.json', output_t1w_full_path)
+            with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
+                json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
 
-                if not os.path.isdir(output_mask_dir):
-                    os.makedirs(output_mask_dir, exist_ok=True)
+            output_t1w_ds_rel_path = os.path.relpath(output_t1w_full_path, output_dataset_dir)
 
-                qc_data = None
+            output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}",
+                                        f"bids::{output_t1w_ds_rel_path}"],
+                                        'Volume': mask_vol['volume_ml'], 'VolumeUnit': 'ml'}
+            output_mask_sidecar_full_path = re.sub(r'\.nii\.gz$', '.json', output_mask_full_path)
+            with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
+                json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
 
-                conformed_t1w = os.path.join(args.hd_bet_input_dir, t1w_image_file_name)
-                hdbet_mask = conformed_t1w.replace('_T1w.nii.gz', '_T1w_bet.nii.gz')
+            output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
+            shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
 
-                if not os.path.exists(conformed_t1w):
-                    raise(PipelineError(f"Conformed T1w image not found: {conformed_t1w}"))
-                if not os.path.exists(hdbet_mask):
-                    raise(PipelineError(f"HD-BET mask not found: {hdbet_mask}"))
-
-                if (args.trim_neck):
-                    trim_results = trim_neck(conformed_t1w, hdbet_mask, working_dir)
-                    output_t1w_image = trim_results['output_image']
-                    output_mask_image = trim_results['output_mask']
-                    # Use the trimmed region image and the original hdbet mask to make QC images
-                    qc_data = get_qc_data(conformed_t1w, hdbet_mask,
-                                          working_dir, trim_results['trim_region_input_space'])
-                else:
-                    output_t1w_image = conformed_t1w
-                    output_mask_image = hdbet_mask
-                    qc_data = get_qc_data(output_t1w_image, output_mask_image, working_dir)
-
-                if (args.reset_origin):
-                    reset_origin_results = reset_origin(output_t1w_image, output_mask_image, working_dir)
-                    output_t1w_image = reset_origin_results['output_image']
-                    output_mask_image = reset_origin_results['output_mask']
-
-                if qc_data['qc_failure']:
-                    raise(PipelineError("QC failure"))
-
-                # Get mask volume in the trimmed space - just in case there's any small differences due to reslicing
-                mask_vol = get_mask_volume(output_mask_image)
-
-                # Copy preprocessed images and masks to output dataset and make sidecars
-                shutil.copyfile(output_t1w_image, output_t1w_full_path)
-                shutil.copyfile(output_mask_image, output_mask_full_path)
-
-                output_t1w_sidecar_json = {'SkullStripped': False, 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}"]}
-                output_t1w_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_t1w_full_path)
-                with open(output_t1w_sidecar_full_path, 'w') as sidecar_out:
-                    json.dump(output_t1w_sidecar_json, sidecar_out, indent=2, sort_keys=True)
-
-                output_t1w_ds_rel_path = os.path.relpath(output_t1w_full_path, output_dataset_dir)
-
-                output_mask_sidecar_json = {'Type': 'Brain', 'Sources': [f"bids:{input_dataset_name}:{t1w_ds_rel_path}",
-                                            f"bids::{output_t1w_ds_rel_path}"],
-                                            'Volume': mask_vol['volume_ml'], 'VolumeUnit': 'ml'}
-                output_mask_sidecar_full_path = re.sub('\.nii\.gz$', '.json', output_mask_full_path)
-                with open(output_mask_sidecar_full_path, 'w') as sidecar_out:
-                    json.dump(output_mask_sidecar_json, sidecar_out, indent=2, sort_keys=True)
-
-                output_qc_image = os.path.join(output_anat_dir_full_path, f"{t1w_source_entities}_desc-qcslice_rgb.png")
-                shutil.copyfile(qc_data['qc_rgb_png'], output_qc_image)
-
-            except Exception as e:
-                pipeline_error_list.append(f"{t1w_ds_rel_path}\t{e}")
-                print(f'Error processing {t1w_ds_rel_path}: {e}')
-            finally:
-                if working_dir_tmpdir is not None:
-                    working_dir_tmpdir.cleanup()
+        except Exception as e:
+            pipeline_error_list.append(f"{t1w_ds_rel_path}\t{e}")
+            print(f'Error processing {t1w_ds_rel_path}: {e}')
+        finally:
+            if working_dir_tmpdir is not None:
+                working_dir_tmpdir.cleanup()
 
     print("Input dataset: " + input_dataset_dir + "\nOutput dataset: " + output_dataset_dir)
 
