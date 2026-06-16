@@ -165,6 +165,8 @@ def main():
     optional.add_argument("--acq-preference-ranks", help="Text file or comma-separated list of acquisition labels, in order of "
                           "preference. The script will select the first image that has an acq label exactly matching one of "
                           "the available options.", type=str)
+    optional.add_argument("--last-run-only", help="Only select the last run for each acquisition, if multiple runs are "
+                          "present.", action='store_true')
     optional.add_argument("--pipeline-output-dataset", help="Output BIDS derivative dataset dir, containing the final outputs "
                           "of the pipeline. This is only used to find existing output so that we do not duplicate processing",
                           type=str, default=None)
@@ -267,9 +269,11 @@ def main():
         try:
             if bids_layout is not None:
                 t1w_image_file_names = \
-                    find_t1w_images_from_bids(bids_layout, participant, sess, bids_filter, acq_preference_order)
+                    find_t1w_images_from_bids(bids_layout, participant, sess, bids_filter, acq_preference_order,
+                                              args.last_run_only)
             else:
-                t1w_image_file_names = find_t1w_images_from_filesystem(session_full_path, acq_preference_order)
+                t1w_image_file_names = find_t1w_images_from_filesystem(session_full_path, acq_preference_order,
+                                                                       args.last_run_only)
         except FileNotFoundError:
             print(f"No anat directory for participant {participant} session {sess} in input dataset {input_dataset_dir}")
             pipeline_error_list.append(f"sub-{participant}/ses-{sess}\tanat directory not found")

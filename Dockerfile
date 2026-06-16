@@ -9,9 +9,7 @@ ARG GIT_COMMIT="unknown"
 # Get c3d
 COPY --from=pyushkevich/tk:2023b /tk/c3d/build/c3d /opt/bin/c3d
 
-COPY scripts/* /opt/bin
 COPY bids_requirements.txt /opt/bids_requirements.txt
-
 # Need pybids to support filters, version used must be OK with pinned
 # dependencies in base image. 0.22.0 appears to be good
 RUN pip install \
@@ -19,6 +17,7 @@ RUN pip install \
       --no-deps \
       -r /opt/bids_requirements.txt
 
+COPY scripts/* /opt/bin
 
 LABEL maintainer="Philip A Cook (https://github.com/cookpa)"
 LABEL description="Containerized pre-processing using HD-BET and c3d."
